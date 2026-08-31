@@ -193,7 +193,7 @@
             "T2ramsey": 3.3203132060859235e-06,
             "phi0_current": 51.408217334922114,
             "chi": -200000.0,
-            "grid_location": "5,0",
+            "grid_location": "0,1",
             "__class__": "quam_libs.components.transmon.Transmon"
         },
         "q2": {
@@ -371,7 +371,7 @@
             "T2ramsey": 2.4893028785835507e-06,
             "phi0_current": 46.75357083874242,
             "chi": -50000.0,
-            "grid_location": "4,0",
+            "grid_location": "1,1",
             "__class__": "quam_libs.components.transmon.Transmon"
         },
         "q3": {
