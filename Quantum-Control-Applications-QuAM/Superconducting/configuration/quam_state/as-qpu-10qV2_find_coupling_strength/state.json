@@ -734,7 +734,7 @@
                 "EPC": 0.004217068442579575,
                 "EPG_incoh": 0.0008408678264721322,
                 "EPC_incoh": 0.0015766271746352478,
-                "sweet_offset": 0.014766468785479572,
+                "sweet_offset": 0.014766468785479572
             },
             "__class__": "quam_libs.components.transmon.Transmon"
         },
@@ -1108,7 +1108,7 @@
                 "EPC": 0.0025845158418884018,
                 "EPG_incoh": 0.006318121314497649,
                 "EPC_incoh": 0.011846477464683092,
-                "sweet_offset": -0.007645710438191905,
+                "sweet_offset": -0.007645710438191905
             },
             "__class__": "quam_libs.components.transmon.Transmon"
         },
