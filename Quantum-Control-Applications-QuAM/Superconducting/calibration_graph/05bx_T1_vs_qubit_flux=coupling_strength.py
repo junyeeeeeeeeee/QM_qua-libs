@@ -91,7 +91,7 @@ config = machine.generate_config()
 # Open Communication with the QOP
 if node.parameters.load_data_id is None:
     qmm = machine.connect()
-    
+
 qubit_pair = machine.qubit_pairs[node.parameters.qubit_pair]
 
 # Get the relevant QuAM components
@@ -155,7 +155,7 @@ with program() as t1_vs_qubit_flux:
         for flux_q in flux_qubits:
             flux_q.z.settle()
         qubit.align()
-        
+
         if reset_coupler_bias:
             qubit_pair.coupler.set_dc_offset(0.0)
         else:
@@ -173,7 +173,7 @@ with program() as t1_vs_qubit_flux:
                     else:
                         qubit.resonator.wait(qubit.thermalization_time * u.ns)
                         qubit_pair.align()
-                    
+
                     if not node.parameters.use_qubit_flux_pulse:
                         for flux_q in flux_qubits:
                             flux_q.z.set_dc_offset(flux_qubit)
@@ -184,7 +184,7 @@ with program() as t1_vs_qubit_flux:
                     qubit_pair.coupler.wait(qubit.xy.operations["x180"].length // 4 + XY_delay // 4)
                     for flux_q in flux_qubits:
                         flux_q.z.wait(qubit.xy.operations["x180"].length // 4 + XY_delay // 4)
-                    
+
                     if node.parameters.use_qubit_flux_pulse:
                         for flux_q in flux_qubits:
                             assign(comp_flux_qubit, arb_flux_bias_offset[flux_q.name] + flux_qubit)
@@ -315,6 +315,6 @@ if not node.parameters.simulate:
         node.machine = machine
         node.save()
 
-    
+
 
 # %%

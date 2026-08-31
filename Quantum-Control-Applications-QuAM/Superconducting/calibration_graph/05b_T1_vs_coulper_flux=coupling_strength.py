@@ -90,7 +90,7 @@ config = machine.generate_config()
 # Open Communication with the QOP
 if node.parameters.load_data_id is None:
     qmm = machine.connect()
-    
+
 qubit_pair = machine.qubit_pairs[node.parameters.qubit_pair]
 
 # Get the relevant QuAM components
@@ -137,7 +137,7 @@ with program() as t1_vs_coupler_flux:
         if "c" in qubit.id: qubit.z.set_dc_offset(qubit.z.joint_offset) # for coupler-test case
         qubit.z.settle()
         qubit.align()
-        
+
         if reset_coupler_bias:
             qubit_pair.coupler.set_dc_offset(0.0)
         else:
@@ -155,12 +155,12 @@ with program() as t1_vs_coupler_flux:
                     else:
                         qubit.resonator.wait(qubit.thermalization_time * u.ns)
                         qubit_pair.align()
-                    
+
                     if "coupler_qubit_crosstalk" in qubit_pair.extras:
                         assign(comp_flux_qubit, arb_flux_bias_offset [qubit.name] + qubit_pair.extras["coupler_qubit_crosstalk"] * flux_coupler )
                     else:
                         assign(comp_flux_qubit, arb_flux_bias_offset [qubit.name])
-                    
+
                     if not node.parameters.use_coupler_flux_pulse:
                         qubit_pair.coupler.set_dc_offset(flux_coupler)
                         wait(1000)
@@ -168,7 +168,7 @@ with program() as t1_vs_coupler_flux:
                     qubit.xy.play("x180")
                     qubit.z.wait(qubit.xy.operations["x180"].length // 4 + XY_delay // 4)
                     qubit_pair.coupler.wait(qubit.xy.operations["x180"].length // 4 + XY_delay // 4)
-                    
+
                     qubit.z.play(
                         "const",
                         amplitude_scale= comp_flux_qubit / qubit.z.operations["const"].amplitude,
@@ -177,7 +177,7 @@ with program() as t1_vs_coupler_flux:
                     if node.parameters.use_coupler_flux_pulse:
                         qubit_pair.coupler.play(
                             "const",
-                            amplitude_scale = flux_coupler / qubit_pair.coupler.operations["const"].amplitude, 
+                            amplitude_scale = flux_coupler / qubit_pair.coupler.operations["const"].amplitude,
                             duration = t
                         )
 
