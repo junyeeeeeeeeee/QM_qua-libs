@@ -25,7 +25,13 @@ def fetch_dataset(job, qubits, node_parameters: Parameters) -> xr.Dataset:
     idle_times = get_idle_times_in_clock_cycles(node_parameters)
 
     ds = fetch_results_as_xarray(job.result_handles, qubits, {"sign": [-1, 1], "time": idle_times})
-    ds = convert_IQ_to_V(ds, qubits)
+    # State discrimination streams only ``state``; asking the voltage helper
+    # for absent I/Q variables raises after an otherwise successful acquisition.
+    # Convert exactly the analog quadratures that the QUA program returned and
+    # leave state-only datasets untouched.
+    iq_variables = [name for name in ("I", "Q") if name in ds.data_vars]
+    if iq_variables:
+        ds = convert_IQ_to_V(ds, qubits, iq_variables)
 
     ds = ds.assign_coords({"time": (["time"], 4 * idle_times)})
 

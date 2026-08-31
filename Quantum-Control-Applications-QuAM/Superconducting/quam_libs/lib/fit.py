@@ -47,19 +47,98 @@ def fit_decay_exp(da, dim):
     min_guess = xr.apply_ufunc(get_min, da, input_core_dims=[[dim]]).rename("min guess")
 
     def apply_fit(x, y, a, offset, decay):
-        nan_result = np.full(12, np.nan)
-        try:
-            # fit = curve_fit(decay_exp, x, y, p0=[a, offset, decay], bounds=(0, [1, 1., -1]))[0]
-            fit, residuals = curve_fit(decay_exp, x, y, p0=[a, offset, decay])
-            return np.array(fit.tolist() + np.array(residuals).flatten().tolist())
-            # return np.array([fit.values[k] for k in ["a", "offset", "decay"]])
-        except (RuntimeError, ValueError, TypeError):
-            print("Fit failed:")
-            print(f"{a=}, {offset=}, {decay=}")
-            plt.plot(x, decay_exp(x, a, offset, decay))
-            plt.plot(x, y)
-            plt.show()
-            return nan_result
+        """Return a fixed-size fit result even when the first guess is singular.
+
+        ``qiskit_experiments.guess.exp_decay`` may legitimately return zero for
+        a noisy or nearly flat trace.  Zero is a singular starting point for the
+        exponential lifetime and the previous exception branch returned ``None``;
+        ``xarray.apply_ufunc(vectorize=True)`` then crashed before Qualibrate could
+        save the acquired snapshot.  Try several physical negative decay guesses,
+        then fall back to a deterministic lifetime grid with linear amplitude and
+        offset estimation.
+        """
+        x = np.asarray(x, dtype=float).reshape(-1)
+        y = np.asarray(y, dtype=float).reshape(-1)
+        finite = np.isfinite(x) & np.isfinite(y)
+        x = x[finite]
+        y = y[finite]
+        if x.size < 4:
+            return np.full(12, np.nan, dtype=float)
+        order = np.argsort(x)
+        x = x[order]
+        y = y[order]
+        x = x - x[0]
+        span = float(x[-1])
+        if not np.isfinite(span) or span <= 0:
+            return np.full(12, np.nan, dtype=float)
+
+        tail_count = max(2, x.size // 10)
+        tail = float(np.median(y[-tail_count:]))
+        signed_amplitude = float(np.median(y[:tail_count]) - tail)
+        if not np.isfinite(signed_amplitude) or signed_amplitude == 0:
+            signed_amplitude = float(a) if np.isfinite(a) else float(np.ptp(y))
+        initial_offset = tail if np.isfinite(tail) else float(offset)
+        decay_guesses = []
+        if np.isfinite(decay) and float(decay) < 0:
+            decay_guesses.append(float(decay))
+        decay_guesses.extend(-1.0 / (span * factor) for factor in (0.1, 0.25, 0.5, 1.0, 2.0, 5.0))
+
+        best = None
+        best_error = np.inf
+        for decay_guess in decay_guesses:
+            try:
+                parameters, covariance = curve_fit(
+                    decay_exp,
+                    x,
+                    y,
+                    p0=[signed_amplitude, initial_offset, decay_guess],
+                    maxfev=20000,
+                )
+            except (RuntimeError, ValueError, FloatingPointError):
+                continue
+            residual = y - decay_exp(x, *parameters)
+            error = float(np.dot(residual, residual))
+            if np.isfinite(error) and error < best_error:
+                best = (parameters, covariance)
+                best_error = error
+        if best is not None:
+            parameters, covariance = best
+            return np.asarray(
+                parameters.tolist() + np.asarray(covariance).reshape(-1).tolist(),
+                dtype=float,
+            )
+
+        positive_steps = np.diff(x)
+        positive_steps = positive_steps[positive_steps > 0]
+        minimum_tau = (
+            max(float(np.median(positive_steps)), span / 1000.0)
+            if positive_steps.size
+            else span / 1000.0
+        )
+        lifetimes = np.geomspace(minimum_tau, span * 100.0, 600)
+        fallback = None
+        for lifetime in lifetimes:
+            exponential = np.exp(-x / lifetime)
+            design = np.column_stack((exponential, np.ones_like(exponential)))
+            coefficients, _, _, _ = np.linalg.lstsq(design, y, rcond=None)
+            residual = y - design @ coefficients
+            error = float(np.dot(residual, residual))
+            if np.isfinite(error) and (fallback is None or error < fallback[0]):
+                fallback = (error, float(lifetime), coefficients, exponential)
+        if fallback is None:
+            return np.full(12, np.nan, dtype=float)
+        error, lifetime, coefficients, exponential = fallback
+        amplitude, fitted_offset = (float(value) for value in coefficients)
+        fitted_decay = -1.0 / lifetime
+        derivative_decay = amplitude * x * exponential
+        jacobian = np.column_stack((exponential, np.ones_like(x), derivative_decay))
+        degrees_of_freedom = max(x.size - 3, 1)
+        covariance = (error / degrees_of_freedom) * np.linalg.pinv(jacobian.T @ jacobian)
+        return np.asarray(
+            [amplitude, fitted_offset, fitted_decay]
+            + np.asarray(covariance).reshape(-1).tolist(),
+            dtype=float,
+        )
 
     fit_res = xr.apply_ufunc(
         apply_fit,

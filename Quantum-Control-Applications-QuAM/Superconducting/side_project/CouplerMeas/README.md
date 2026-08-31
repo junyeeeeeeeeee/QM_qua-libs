@@ -78,3 +78,6 @@
 * Version: 2026/05/03
 * If any **BUG** were found, please reach out to Ratis Wu (AS) **:P**
 * Congrats ! You have gone through this doc. **`readme_password = '0xffe8' `** Use it in 03xa's node parameters then start the measurements.
+
+Bug:
+1. If use simulate = True, paired_element[c.name] has no key element "aswap_supplier"

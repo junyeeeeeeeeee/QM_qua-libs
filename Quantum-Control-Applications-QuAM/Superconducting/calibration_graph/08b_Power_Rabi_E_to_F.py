@@ -44,12 +44,12 @@ import numpy as np
 class Parameters(NodeParameters):
 
     qubits: Optional[List[str]] = None
-    num_averages: int = 200
+    num_averages: int = 1000
     operation: str = "EF_x180"
     min_amp_factor: float = 0.0
     max_amp_factor: float = 1.79
     amp_factor_step: float = 0.005
-    flux_point_joint_or_independent: Literal["joint", "independent"] = "independent"
+    flux_point_joint_or_independent: Literal["joint", "independent"] = "joint"
     simulate: bool = False
     timeout: int = 100
 
@@ -252,7 +252,7 @@ else:
     node.results["figure"] = grid.fig
 
     # %% {Update_state}
-    ef_operation_name = f"EF_{operation}"
+    ef_operation_name = operation
     for q in qubits:
         if ef_operation_name not in q.xy.operations:
             # Create the |e> -> |f> operation
@@ -275,3 +275,5 @@ else:
     node.outcomes = {q.name: "successful" for q in qubits}
     node.results["initial_parameters"] = node.parameters.model_dump()
     node.save()
+
+# %%

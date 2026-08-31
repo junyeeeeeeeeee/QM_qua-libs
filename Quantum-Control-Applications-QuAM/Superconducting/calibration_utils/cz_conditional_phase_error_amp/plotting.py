@@ -19,6 +19,10 @@ def plot_raw_data_with_fit(
       - horizontal dashed line at phase=0.5 reference (shown via colorbar context)
       - secondary x-axis with detuning (MHz)
     """
+    amplitude_sweep = "qubit"
+    if node is not None:
+        amplitude_sweep = node.namespace.get("amplitude_sweep", "qubit")
+
     n_pairs = len(qubit_pairs)
     cols = min(4, n_pairs)
     rows = (n_pairs + cols - 1) // cols
@@ -49,20 +53,20 @@ def plot_raw_data_with_fit(
         )
         ax_main.axvline(fr.optimal_amplitude.item(), color="lime", lw=2, label="optimal")
 
-        # Secondary x-axis: detuning (MHz)
-        quad = qp.qubit_control.freq_vs_flux_01_quad_term
+        if amplitude_sweep == "qubit":
+            quad = qp.qubit_control.freq_vs_flux_01_quad_term
 
-        def amp_to_detuning_MHz(a):
-            return -(a**2) * quad / 1e6
+            def amp_to_detuning_MHz(a):
+                return -(a**2) * quad / 1e6
 
-        def detuning_MHz_to_amp(d):
-            return np.sqrt(np.maximum(0, -d * 1e6 / quad))
+            def detuning_MHz_to_amp(d):
+                return np.sqrt(np.maximum(0, -d * 1e6 / quad))
 
-        secax = ax_main.secondary_xaxis("top", functions=(amp_to_detuning_MHz, detuning_MHz_to_amp))
-        secax.set_xlabel("Detuning (MHz)")
+            secax = ax_main.secondary_xaxis("top", functions=(amp_to_detuning_MHz, detuning_MHz_to_amp))
+            secax.set_xlabel("Detuning (MHz)")
 
         ax_main.set_title(qp_name)
-        ax_main.set_xlabel("Amplitude (V)")
+        ax_main.set_xlabel("Coupler amplitude (V)" if amplitude_sweep == "coupler" else "Amplitude (V)")
         ax_main.set_ylabel("# CZ operations")
         ax_main.legend(loc="upper right", fontsize=8)
         cbar = fig.colorbar(pcm, ax=ax_main, shrink=0.85)
@@ -100,6 +104,9 @@ def plot_raw_data_with_fit(
     for j in range(2 * n_pairs, len(axes)):
         axes[j].axis("off")
 
-    fig.suptitle("CZ conditional phase error amplification")
+    title = "CZ conditional phase error amplification"
+    if amplitude_sweep == "coupler":
+        title += " (coupler amp)"
+    fig.suptitle(title)
     fig.tight_layout(rect=(0, 0, 1, 0.97))
     return fig

@@ -38,19 +38,19 @@ import numpy as np
 
 # %% {Node_parameters}
 class Parameters(NodeParameters):
-    qubits: Optional[List[str]] = ["q2"]
+    qubits: Optional[List[str]] = ["q3"]
     """List of qubits to measure. If None or empty, uses all control qubits in the qubit pair."""
-    qubit_pair: str = "coupler_q2_q3"
+    qubit_pair: str = "coupler_q3_q4"
     """Qubit pair to use for the measurement."""
-    num_averages: int = 20
+    num_averages: int = 100
     """Number of averages to perform."""
     min_wait_time_in_ns: int = 16
     """Minimum wait time in nanoseconds."""
-    max_wait_time_in_ns: int = 150000
+    max_wait_time_in_ns: int = 100000
     """Maximum wait time in nanoseconds."""
-    wait_time_step_in_ns: int = 1000
+    wait_time_step_in_ns: int = 2000
     """Step size for wait time in nanoseconds."""
-    flux_point_joint_or_independent_or_arbitrary: Literal["joint", "independent", "arbitrary"] = "independent"
+    flux_point_joint_or_independent_or_arbitrary: Literal["joint", "independent", "arbitrary"] = "joint"
     """Flux point setting for the qubits: 'joint', 'independent', or 'arbitrary'."""
     reset_type: Literal["active", "thermal"] = "thermal"
     """Type of reset to use before each measurement: 'active' or 'thermal'."""
@@ -64,17 +64,17 @@ class Parameters(NodeParameters):
     """Timeout for QOP session in seconds."""
     load_data_id: Optional[int] = None
     """If provided, loads data from a previous run with this ID instead of executing the program."""
-    multiplexed: bool = False
+    multiplexed: bool = True
     """Whether to measure qubits in multiplexed mode."""
-    reset_coupler_bias: bool = True
+    reset_coupler_bias: bool = False
     """Whether to reset the coupler bias to zero before each measurement."""
-    coupler_flux_min : float = -0.5 # relative to the coupler set point
+    coupler_flux_min : float = -0.80 # relative to the coupler set point
     """Minimum coupler flux value."""
-    coupler_flux_max : float =  0.5 # relative to the coupler set point
+    coupler_flux_max : float = -0.2 # relative to the coupler set point
     """Maximum coupler flux value."""
-    coupler_flux_num_points : float = 21
+    coupler_flux_num_points : float = 51
     """Number of coupler flux points."""
-    use_coupler_flux_pulse: bool = False
+    use_coupler_flux_pulse: bool = True
     """Whether to use a coupler flux pulse on the coupler during the idle time."""
 
 node = QualibrationNode(name="05b_T1_vs_coulper_flux", parameters=Parameters())
@@ -178,13 +178,13 @@ with program() as t1_vs_coupler_flux:
                     )
                     if node.parameters.use_coupler_flux_pulse:
                         qubit_pair.coupler.play(
-                            "const", 
+                            "const",
                             amplitude_scale = flux_coupler / qubit_pair.coupler.operations["const"].amplitude, 
                             duration = t
                         )
 
-                    qubit.z.wait(20)
-                    qubit_pair.coupler.wait(20)
+                    qubit.z.wait(200)
+                    qubit_pair.coupler.wait(200)
                     qubit_pair.align()
 
                     # Measure the state of the resonators

@@ -79,21 +79,36 @@ def process_raw_dataset(ds: xr.Dataset, node: QualibrationNode):
     qubit_pairs = node.namespace["qubit_pairs"]
     operation = node.parameters.operation
     gate_refs = node.namespace.get("gate_refs", {})
+    amplitude_sweep = node.namespace.get("amplitude_sweep", "qubit")
 
-    def abs_amp(qp, amp):
-        if qp.name in gate_refs:
-            return amp * gate_refs[qp.name]["qubit_amplitude"]
-        return amp * qp.gates[operation].flux_pulse_control.amplitude
+    if amplitude_sweep == "coupler":
+        def abs_amp(qp, amp):
+            if qp.name in gate_refs:
+                return amp * gate_refs[qp.name]["coupler_amplitude"]
+            return amp * qp.gates[operation].coupler_flux_pulse.amplitude
 
-    def detuning(qp, amp):
-        if qp.name in gate_refs:
-            amplitude_squared = (amp * gate_refs[qp.name]["qubit_amplitude"]) ** 2
-        else:
-            amplitude_squared = (amp * qp.gates[operation].flux_pulse_control.amplitude) ** 2
-        return -amplitude_squared * qp.qubit_control.freq_vs_flux_01_quad_term
+        ds = ds.assign_coords(
+            {"amp_full": (["qubit_pair", "amp"], np.array([abs_amp(qp, ds.amp) for qp in qubit_pairs]))}
+        )
+    else:
+        def abs_amp(qp, amp):
+            if qp.name in gate_refs:
+                return amp * gate_refs[qp.name]["qubit_amplitude"]
+            return amp * qp.gates[operation].flux_pulse_control.amplitude
 
-    ds = ds.assign_coords({"amp_full": (["qubit_pair", "amp"], np.array([abs_amp(qp, ds.amp) for qp in qubit_pairs]))})
-    ds = ds.assign_coords({"detuning": (["qubit_pair", "amp"], np.array([detuning(qp, ds.amp) for qp in qubit_pairs]))})
+        def detuning(qp, amp):
+            if qp.name in gate_refs:
+                amplitude_squared = (amp * gate_refs[qp.name]["qubit_amplitude"]) ** 2
+            else:
+                amplitude_squared = (amp * qp.gates[operation].flux_pulse_control.amplitude) ** 2
+            return -amplitude_squared * qp.qubit_control.freq_vs_flux_01_quad_term
+
+        ds = ds.assign_coords(
+            {"amp_full": (["qubit_pair", "amp"], np.array([abs_amp(qp, ds.amp) for qp in qubit_pairs]))}
+        )
+        ds = ds.assign_coords(
+            {"detuning": (["qubit_pair", "amp"], np.array([detuning(qp, ds.amp) for qp in qubit_pairs]))}
+        )
 
     return ds
 
