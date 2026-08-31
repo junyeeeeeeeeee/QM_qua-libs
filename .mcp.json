@@ -1,0 +1,17 @@
+{
+  "mcpServers": {
+    "jy_bringup": {
+      "type": "stdio",
+      "command": "powershell.exe",
+      "args": [
+        "-NoProfile",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-File",
+        "${CLAUDE_PROJECT_DIR:-.}\\jy_agent.ps1",
+        "-Action",
+        "Stdio"
+      ]
+    }
+  }
+}

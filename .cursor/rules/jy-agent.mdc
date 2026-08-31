@@ -1,0 +1,53 @@
+---
+description: Route the exact JY measurement phrases from the repository-root workspace.
+alwaysApply: true
+---
+
+For unrelated repository work, do not invoke JY tools. For either entry phrase
+below (with or without the space around `JY`), read and follow
+`Quantum-Control-Applications-QuAM/Superconducting/JY_agent/AGENTS.md` and its
+playbook, then use the project `jy_bringup` MCP server:
+
+- `進入 JY 量測模式`: enter conversational measurement mode; each experiment
+  or state change needs approval on the shared Dashboard.
+- `進入 JY 自動量測模式`: enter bounded automatic mode; request one bounded
+  lease approval, wait with `jy_wait_for_autonomy_status`, and stay inside its
+  targets, nodes, quotas, and hard policies. Keep the current agent run active
+  while Cursor permits it; Cursor has no repository rule that can guarantee an
+  indefinite model turn, so if the host pauses, resume from the same Dashboard
+  and the operator's `已核准` message.
+
+For both modes, show only the entry result's top-level `browser_url`. Approval,
+controls, and all experiment results share that Dashboard service. The common
+`/` entry links to the session Home, Approval, and Results & controls pages; do
+not enumerate those internal routes as separate websites.
+
+Treat `進入JY量測模式` and `進入JY自動量測模式` as identical aliases.
+Also treat `Enter JY measurement mode` and `Enter JY automatic measurement mode`
+as exact English aliases.
+
+The root `jy_agent.ps1 -Action Stdio` launcher finds the nested agent relative to
+this workspace; the repository folder itself may have any name. It initializes
+only the MCP protocol. On an entry phrase, run `.\jy_agent.ps1 -Action Ensure`
+before the entry tool so the Dashboard is ready. If Ensure returns
+`recovery_only`, do not
+call an entry tool or publish a URL; direct the on-site operator to the loopback
+recovery console. If MCP is unavailable, do not claim that measurement mode
+started or keep retrying Ensure: run the root Doctor
+action, then ask the user to enable/trust and reload this repository-root project
+MCP configuration, not to reopen the `JY_agent` subfolder.
+
+For configured stop/exit phrases, persist full shutdown, cooperatively stop and
+poll any active JY run, leave or quarantine the workflow, and run `powershell
+-NoProfile -ExecutionPolicy Bypass -File .\jy_agent.ps1 -Action Stop`. A
+retained lock stays available only for local recovery and does not keep the
+Dashboard/MCP/tunnel alive once the worker has exited. Never approve for the user, directly execute a
+calibration script, write `state.json`, or bypass JY policy and hardware locks.
+
+In JY context, `恢復` / `Recover` runs repository-root
+`.\jy_agent.ps1 -Action Recover`; it closes stale workflow/process state without
+depending on the MCP, deleting a retained lock, or killing an unverified
+process. Recognized instrument-connectivity failures pause scheduling and are
+reported on the Dashboard. See
+`Quantum-Control-Applications-QuAM/Superconducting/JY_agent/Command.md` for the
+complete bilingual aliases.

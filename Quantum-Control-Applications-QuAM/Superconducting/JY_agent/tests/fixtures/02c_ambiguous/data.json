@@ -1,0 +1,13 @@
+{
+  "fit_results": {
+    "q1": {}
+  },
+  "figure": "./figure.png",
+  "initial_parameters": {
+    "qubits": ["q1"],
+    "num_averages": 200,
+    "frequency_span_in_mhz": 2.0,
+    "frequency_step_in_mhz": 0.03,
+    "flux_point_joint_or_independent": "joint"
+  }
+}

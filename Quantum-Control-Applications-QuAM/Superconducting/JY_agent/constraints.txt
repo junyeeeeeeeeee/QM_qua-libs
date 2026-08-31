@@ -1,0 +1,12 @@
+# Versions validated against the current Qualibrate environment.
+# Update this file only after running the full JY_agent test suite.
+qualibrate==0.2.2
+mcp==2.0.0
+PyYAML==6.0.2
+numpy==1.26.4
+scipy==1.15.3
+xarray==2025.6.1
+starlette==0.46.2
+sse-starlette==3.0.2
+uvicorn==0.34.3
+pytest==8.3.5

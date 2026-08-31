@@ -1,0 +1,79 @@
+server:
+  host: "127.0.0.1"
+  port: 8765
+  path: "/mcp"
+
+# Review/Approval is a separate HTTP surface. A short-lived Cloudflare quick
+# tunnel exposes only this dashboard; MCP stays on loopback. The bootstrap sets
+# public_base_url and a runtime-only access token through environment variables.
+approval:
+  # local | public. The bootstrap uses public while the Cloudflare tunnel is active.
+  transport: "local"
+  host: "127.0.0.1"
+  port: 8766
+  public_base_url: ""
+  trusted_origins: []
+  trusted_proxy_cidrs: ["127.0.0.0/8", "::1/128"]
+
+paths:
+  # Qualibrate owns state, wiring, Data, and calibration-library locations.
+  runtime: "runtime"
+
+# Empty means: use JY_QUALIBRATE_PYTHON, then the current Python executable.
+qualibrate_python: ""
+
+workflow:
+  sequence: ["02x", "02a", "02c", "03a", "04", "05", "07b", "06", "06b", "10a", "05st", "06st_t2star", "06st_t2e"]
+  default_flux_point: "joint"
+  require_explicit_qubits: true
+
+interaction:
+  measurement_mode_entry_phrase: "進入 JY 量測模式"
+  measurement_mode_entry_phrases:
+    - "進入 JY 量測模式"
+    - "進入JY量測模式"
+    - "Enter JY measurement mode"
+  measurement_mode_exit_phrase: "退出 JY 量測模式"
+  measurement_mode_shutdown_phrase: "結束量測"
+  measurement_mode_shutdown_phrases:
+    - "結束量測"
+    - "結束量測模式"
+    - "結束 JY 量測模式"
+    - "結束JY量測模式"
+    - "結束 JY 自動量測模式"
+    - "結束JY自動量測模式"
+    - "結束 JY 自動量測"
+    - "結束JY自動量測"
+    - "退出 JY 量測模式"
+    - "退出JY量測模式"
+    - "退出 JY 自動量測模式"
+    - "退出JY自動量測模式"
+    - "退出 JY 自動量測"
+    - "退出JY自動量測"
+    - "停止量測"
+    - "停止量測模式"
+    - "停止 JY 量測模式"
+    - "停止JY量測模式"
+    - "停止 JY 自動量測模式"
+    - "停止JY自動量測模式"
+    - "停止 JY 自動量測"
+    - "停止JY自動量測"
+    - "End measurement"
+    - "Stop measurement"
+    - "Exit JY measurement mode"
+    - "End JY measurement mode"
+    - "Stop JY measurement mode"
+    - "Exit JY automatic measurement mode"
+    - "End JY automatic measurement mode"
+    - "Stop JY automatic measurement mode"
+  # Conversational mode uses per-run/per-state review. Autonomous mode requests
+  # one bounded lease and may continue the allowlisted bring-up sequence.
+  autonomy_mode_entry_phrase: "進入 JY 自動量測模式"
+  autonomy_mode_entry_phrases:
+    - "進入 JY 自動量測模式"
+    - "進入JY自動量測模式"
+    - "Enter JY automatic measurement mode"
+  recovery_phrases:
+    - "恢復"
+    - "恢复"
+    - "Recover"

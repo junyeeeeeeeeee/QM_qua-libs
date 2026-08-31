@@ -1,0 +1,10 @@
+{
+  "ds": "./ds.h5",
+  "figure": "./figure.png",
+  "initial_parameters": {
+    "qubits": ["q1"],
+    "num_averages": 300,
+    "frequency_span_in_mhz": 20.0,
+    "frequency_step_in_mhz": 0.05
+  }
+}

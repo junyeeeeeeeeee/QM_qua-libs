@@ -1,0 +1,12 @@
+#:schema https://developers.openai.com/codex/config-schema.json
+
+# Template only. Run `jy_agent.ps1 -Action Install` to generate config.toml
+# with absolute paths for the current checkout.
+[mcp_servers.jy_bringup]
+command = "powershell.exe"
+args = ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "C:\\ABSOLUTE\\REPOSITORY\\jy_agent.ps1", "-Action", "Stdio"]
+cwd = "C:\\ABSOLUTE\\REPOSITORY"
+required = false
+startup_timeout_sec = 90
+tool_timeout_sec = 120
+default_tools_approval_mode = "auto"

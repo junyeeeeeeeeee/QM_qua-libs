@@ -1,0 +1,579 @@
+version: 1
+
+protected_paths:
+  - "calibration_graph"
+  - "Script"
+
+approval:
+  run_ttl_minutes: 60
+  state_commit_ttl_minutes: 60
+  max_auto_retries_per_approval: 2
+  require_interactive_tty: true
+
+# One human approval delegates only the bounded actions below. A null total-run
+# limit is intentional; the per-(node, qubit) attempt limit remains mandatory.
+autonomy:
+  duration_hours: 8
+  max_total_runs: null
+  max_attempts_per_node_qubit: 20
+  auto_state_commit_analysis_statuses: ["pass"]
+  pause_on_analysis_statuses: []
+  emergency_stop_grace_seconds: 30
+  watchdog_interval_seconds: 2
+  halt_conditions:
+    - "snapshot_missing"
+    - "worker_failure"
+    - "state_hash_conflict"
+    - "hardware_lock_anomaly"
+    - "parameter_policy_violation"
+
+# Thermal reset is the safe default everywhere. Active reset is evidence-gated
+# per qubit by an active-reset 07b run with compact clouds and >= 85% fidelity.
+# If active reset is used for statistics, all three lifetime baselines must be
+# repeated and accepted with active reset before any statistics node may start.
+reset_policy:
+  default_type: "thermal"
+  active_qualification_node: "07b"
+  active_min_readout_fidelity: 0.85
+  active_statistics_verification_nodes: ["05", "06", "06b"]
+
+instrument_limits:
+  qubit_if_abs_hz: 400000000
+  resonator_if_abs_hz: 400000000
+  max_sweep_points: 20001
+  max_num_averages: 100000
+  mw:
+    max_wf_amplitude: 1.0
+    max_x180_wf_amplitude: 1.0
+  iq:
+    max_wf_amplitude: 0.5
+    max_x180_wf_amplitude: 0.3
+  bootstrap_x180_fraction: 0.5
+  bootstrap_x90_fraction_of_x180: 0.5
+  opx1000_full_scale_power_dbm:
+    min: -11
+    max: 16
+  mw_upconverter_frequency_hz:
+    min: 2000000000
+    max: 18000000000
+  drive_lo_grid_hz: 100000000
+  multiplex:
+    max_qubits_per_run: 10
+    max_qubits_per_readout_line: 5
+    min_resonator_spacing_hz: 1000000
+    max_aggregate_readout_amplitude: 0.5
+
+analysis:
+  statistics:
+    # One requested statistics run contains 100 repetitions. Its raw iterations
+    # are not re-fitted or used as an additional all-or-nothing acceptance gate.
+    required_repetitions: 100
+  "04":
+    # q3/q4/q5 reference run: 14.86 / 24.73 / 26.91 at 500 averages.
+    # The floor is deliberately anchored just below the weakest accepted trace.
+    min_robust_snr: 14.0
+    noise_confirmation_num_averages: [500, 1000, 2000, 4000]
+    max_noise_confirmation_num_averages: 4000
+  "05":
+    # q3/q4/q5 reference run: 25.06 / 52.19 / 62.50 at 2000 averages.
+    min_robust_snr: 25.0
+    noise_confirmation_num_averages: [2000, 4000, 8000]
+    max_noise_confirmation_num_averages: 8000
+  "07b":
+    min_readout_fidelity: 0.70
+    active_reset_min_readout_fidelity: 0.85
+    max_cloud_axis_ratio: 4.0
+    max_p95_to_median_radius: 4.0
+    max_p99_to_median_radius: 4.0
+    min_cloud_samples: 1000
+    tail_retry_amplitude_factor: 0.7071067811865476
+    min_readout_amplitude: 0.005
+  "03a":
+    initial_coarse_span_mhz: 800.0
+    initial_coarse_operation_amplitude_factor: 0.10
+    coarse_min_span_mhz: 200.0
+    refinement_max_span_mhz: 100.0
+    refinement_max_operation_amplitude_factor: 0.10
+    final_max_span_mhz: 100.0
+    final_max_operation_amplitude_factor: 0.05
+    final_min_feature_fwhm_mhz: 0.5
+    final_max_feature_fwhm_mhz: 10.0
+    min_robust_snr: 10.0
+    min_edge_fraction: 0.05
+    two_photon_detection_min_operation_amplitude_factor: 0.075
+    two_photon_pair_min_separation_mhz: 50.0
+    two_photon_pair_max_separation_mhz: 150.0
+    two_photon_lower_max_width_ratio: 0.60
+    two_photon_min_peak_snr: 5.0
+    two_photon_peak_min_distance_mhz: 10.0
+    noise_confirmation_num_averages: [500, 1000, 2000]
+    max_noise_confirmation_num_averages: 2000
+  "02c":
+    plateau_tail_fraction: 0.20
+    min_plateau_points: 4
+    plateau_min_coverage: 0.70
+    min_frequency_separation_steps: 4.0
+    plateau_band_steps: 2.0
+    plateau_band_fraction_of_separation: 0.15
+    max_plateau_width_steps: 4.0
+    max_plateau_width_fraction_of_separation: 0.35
+    min_depletion_points: 2
+    min_transition_monotonic_fraction: 0.70
+    transition_monotonic_slack_fraction: 0.10
+    frequency_edge_fraction: 0.05
+    selected_power_tolerance_steps: 2.0
+    smoothing_window_points: 3
+    bare_only_max_trace_width_steps: 2.0
+    bare_only_bare_match_steps: 3.0
+    bare_only_required_min_power_dbm: -50.0
+    bare_only_max_frequency_span_mhz: 10.0
+    bare_only_max_frequency_step_mhz: 0.1
+    bare_only_min_num_averages: 200
+    bare_only_min_readout_length_ns: 1000
+    bare_only_min_low_power_snr: 5.0
+    bare_only_min_power_points: 40
+
+state_commit:
+  allowed_json_pointer_patterns:
+    - "^/ports/mw_outputs/[^/]+/[0-9]+/[0-9]+/upconverter_frequency$"
+    - "^/qubits/q[0-9]+/xy/intermediate_frequency$"
+    - "^/qubits/q[0-9]+/xy/operations/[A-Za-z0-9_-]+/amplitude$"
+    - "^/qubits/q[0-9]+/resonator/intermediate_frequency$"
+    - "^/qubits/q[0-9]+/resonator/operations/readout/(amplitude|full_scale_power_dbm|integration_weights_angle)$"
+    - "^/qubits/q[0-9]+/resonator/operations/readout/(threshold|rus_exit_threshold)$"
+    - "^/qubits/q[0-9]+/resonator/confusion_matrix$"
+    - "^/qubits/q[0-9]+/extras/(bare_resonator_freq|idle_freq|dressed_resonator_freq)$"
+    - "^/qubits/q[0-9]+/extras/(readout_fidelity|T1|T1_dev|T2ramsey|T2ramsey_dev|T2|T2_dev)$"
+    - "^/qubits/q[0-9]+/T1$"
+    - "^/qubits/q[0-9]+/T2(ramsey|echo)$"
+  allowed_operations: ["add", "replace"]
+  require_base_hash_match: true
+  always_require_human_approval: true
+
+nodes:
+  "02x":
+    name: "02x_Bare_Resonator_Spectroscopy"
+    script: "02x_Bare_Resonator_Spectroscopy.py"
+    flux_behavior: "hardcoded_min"
+    defaults:
+      num_averages: 300
+      frequency_span_in_mhz: 20.0
+      frequency_step_in_mhz: 0.05
+      simulate: false
+      simulation_duration_ns: 2500
+      timeout: 100
+      load_data_id: null
+      multiplexed: false
+    allowed_parameters:
+      qubits: "qubit_list"
+      num_averages: "positive_int"
+      frequency_span_in_mhz: "positive_number"
+      frequency_step_in_mhz: "positive_number"
+      simulate: "bool"
+      simulation_duration_ns: "positive_int"
+      timeout: "positive_int"
+      load_data_id: "optional_positive_int"
+      multiplexed: "bool"
+
+  "02a":
+    name: "02a_Resonator_Spectroscopy"
+    script: "02a_Resonator_Spectroscopy.py"
+    flux_behavior: "hardcoded_min"
+    defaults:
+      num_averages: 300
+      frequency_span_in_mhz: 40.0
+      frequency_step_in_mhz: 0.1
+      simulate: false
+      simulation_duration_ns: 2500
+      timeout: 100
+      load_data_id: null
+      multiplexed: false
+    allowed_parameters:
+      qubits: "qubit_list"
+      num_averages: "positive_int"
+      frequency_span_in_mhz: "positive_number"
+      frequency_step_in_mhz: "positive_number"
+      simulate: "bool"
+      simulation_duration_ns: "positive_int"
+      timeout: "positive_int"
+      load_data_id: "optional_positive_int"
+      multiplexed: "bool"
+
+  "02c":
+    name: "02c_Resonator_Spectroscopy_vs_Amplitude"
+    script: "02c_resonator_spectroscopy_vs_amplitude.py"
+    flux_behavior: "joint"
+    defaults:
+      num_averages: 200
+      frequency_span_in_mhz: 2.0
+      frequency_step_in_mhz: 0.03
+      simulate: false
+      simulation_duration_ns: 2500
+      timeout: 100
+      max_power_dbm: -10
+      min_power_dbm: -50
+      num_power_points: 40
+      max_amp: 0.5
+      flux_point_joint_or_independent: "joint"
+      ro_line_attenuation_dB: 0.0
+      derivative_crossing_threshold_in_hz_per_dbm: -50000
+      derivative_smoothing_window_num_points: 30
+      moving_average_filter_window_num_points: 30
+      multiplexed: false
+      load_data_id: null
+    allowed_parameters:
+      qubits: "qubit_list"
+      num_averages: "positive_int"
+      frequency_span_in_mhz: "positive_number"
+      frequency_step_in_mhz: "positive_number"
+      simulate: "bool"
+      simulation_duration_ns: "positive_int"
+      timeout: "positive_int"
+      max_power_dbm: "number"
+      min_power_dbm: "number"
+      num_power_points: "positive_int"
+      max_amp: "positive_number"
+      flux_point_joint_or_independent: "joint_literal"
+      ro_line_attenuation_dB: "number"
+      derivative_crossing_threshold_in_hz_per_dbm: "number"
+      derivative_smoothing_window_num_points: "positive_int"
+      moving_average_filter_window_num_points: "positive_int"
+      multiplexed: "bool"
+      load_data_id: "optional_positive_int"
+
+  "03a":
+    name: "03a_Qubit_Spectroscopy"
+    script: "03a_Qubit_Spectroscopy.py"
+    flux_behavior: "joint"
+    defaults:
+      num_averages: 100
+      operation: "saturation"
+      operation_amplitude_factor: 0.10
+      operation_len_in_ns: 50000
+      frequency_span_in_mhz: 800.0
+      frequency_step_in_mhz: 1.0
+      flux_point_joint_or_independent: "joint"
+      target_peak_width: 1000000.0
+      arbitrary_flux_bias: null
+      arbitrary_qubit_frequency_in_ghz: null
+      simulate: false
+      simulation_duration_ns: 2500
+      timeout: 100
+      load_data_id: null
+      multiplexed: false
+    allowed_parameters:
+      qubits: "qubit_list"
+      num_averages: "positive_int"
+      operation: "saturation_literal"
+      operation_amplitude_factor: "positive_number"
+      operation_len_in_ns: "positive_int"
+      frequency_span_in_mhz: "positive_number"
+      frequency_step_in_mhz: "positive_number"
+      flux_point_joint_or_independent: "joint_literal"
+      target_peak_width: "positive_number"
+      arbitrary_flux_bias: "optional_number"
+      arbitrary_qubit_frequency_in_ghz: "optional_number"
+      simulate: "bool"
+      simulation_duration_ns: "positive_int"
+      timeout: "positive_int"
+      load_data_id: "optional_positive_int"
+      multiplexed: "bool"
+
+  "04":
+    name: "04_Power_Rabi"
+    script: "04_Power_Rabi.py"
+    flux_behavior: "joint"
+    defaults:
+      num_averages: 500
+      operation_x180_or_any_90: "x180"
+      min_amp_factor: 0.0
+      max_amp_factor: 1.9
+      amp_factor_step: 0.01
+      max_number_rabi_pulses_per_sweep: 1
+      flux_point_joint_or_independent: "joint"
+      reset_type_thermal_or_active: "thermal"
+      state_discrimination: false
+      update_x90: true
+      simulate: false
+      simulation_duration_ns: 1500
+      timeout: 200
+      load_data_id: null
+      multiplexed: true
+    allowed_parameters:
+      qubits: "qubit_list"
+      num_averages: "positive_int"
+      operation_x180_or_any_90: "xy_operation_literal"
+      min_amp_factor: "nonnegative_number"
+      max_amp_factor: "positive_number"
+      amp_factor_step: "positive_number"
+      max_number_rabi_pulses_per_sweep: "positive_int"
+      flux_point_joint_or_independent: "joint_literal"
+      reset_type_thermal_or_active: "reset_literal"
+      state_discrimination: "bool"
+      update_x90: "bool"
+      simulate: "bool"
+      simulation_duration_ns: "positive_int"
+      timeout: "positive_int"
+      load_data_id: "optional_positive_int"
+      multiplexed: "bool"
+
+  "05":
+    name: "05_T1"
+    script: "05_T1.py"
+    flux_behavior: "joint"
+    defaults:
+      num_averages: 2000
+      min_wait_time_in_ns: 16
+      max_wait_time_in_ns: 200000
+      wait_time_step_in_ns: 2000
+      flux_point_joint_or_independent_or_arbitrary: "joint"
+      reset_type: "thermal"
+      use_state_discrimination: false
+      simulate: false
+      simulation_duration_ns: 2500
+      timeout: 100
+      load_data_id: null
+      multiplexed: true
+    allowed_parameters:
+      qubits: "qubit_list"
+      num_averages: "positive_int"
+      min_wait_time_in_ns: "positive_int"
+      max_wait_time_in_ns: "positive_int"
+      wait_time_step_in_ns: "positive_int"
+      flux_point_joint_or_independent_or_arbitrary: "joint_literal"
+      reset_type: "reset_literal"
+      use_state_discrimination: "bool"
+      simulate: "bool"
+      simulation_duration_ns: "positive_int"
+      timeout: "positive_int"
+      load_data_id: "optional_positive_int"
+      multiplexed: "bool"
+
+  "07b":
+    name: "07b_IQ_Blobs"
+    script: "07b_IQ_Blobs.py"
+    flux_behavior: "joint"
+    defaults:
+      multiplexed: true
+      flux_point_joint_or_independent: "joint"
+      num_runs: 10000
+      reset_type_thermal_or_active: "thermal"
+      load_data_id: null
+      simulate: false
+      simulation_duration_ns: 1000
+      timeout: 100
+    allowed_parameters:
+      qubits: "qubit_list"
+      multiplexed: "bool"
+      flux_point_joint_or_independent: "joint_literal"
+      num_runs: "positive_int"
+      reset_type_thermal_or_active: "reset_literal"
+      load_data_id: "optional_positive_int"
+      simulate: "bool"
+      simulation_duration_ns: "positive_int"
+      timeout: "positive_int"
+
+  "06":
+    name: "06_Ramsey"
+    script: "06_Ramsey.py"
+    flux_behavior: "joint"
+    defaults:
+      num_averages: 1000
+      reset_type: "thermal"
+      frequency_detuning_in_mhz: 8.0
+      min_wait_time_in_ns: 16
+      max_wait_time_in_ns: 200000
+      num_time_points: 100
+      log_or_linear_sweep: "log"
+      use_state_discrimination: true
+      flux_point_joint_or_independent: "joint"
+      load_data_id: null
+      multiplexed: true
+      use_waveform_report: false
+      simulate: false
+      simulation_duration_ns: 2500
+      timeout: 100
+    allowed_parameters:
+      qubits: "qubit_list"
+      num_averages: "positive_int"
+      reset_type: "reset_literal"
+      frequency_detuning_in_mhz: "positive_number"
+      min_wait_time_in_ns: "positive_int"
+      max_wait_time_in_ns: "positive_int"
+      num_time_points: "positive_int"
+      log_or_linear_sweep: "linear_log_literal"
+      use_state_discrimination: "bool"
+      flux_point_joint_or_independent: "joint_literal"
+      load_data_id: "optional_positive_int"
+      multiplexed: "bool"
+      use_waveform_report: "bool"
+      simulate: "bool"
+      simulation_duration_ns: "positive_int"
+      timeout: "positive_int"
+
+  "06b":
+    name: "06b_T2_echo"
+    script: "06b_T2_echo.py"
+    flux_behavior: "joint"
+    defaults:
+      num_averages: 1000
+      min_wait_time_in_ns: 16
+      max_wait_time_in_ns: 200000
+      wait_time_step_in_ns: 1000
+      flux_point_joint_or_independent_or_arbitrary: "joint"
+      simulate: false
+      timeout: 100
+      use_state_discrimination: true
+      reset_type: "thermal"
+    allowed_parameters:
+      qubits: "qubit_list"
+      num_averages: "positive_int"
+      min_wait_time_in_ns: "positive_int"
+      max_wait_time_in_ns: "positive_int"
+      wait_time_step_in_ns: "positive_int"
+      flux_point_joint_or_independent_or_arbitrary: "joint_literal"
+      simulate: "bool"
+      timeout: "positive_int"
+      use_state_discrimination: "bool"
+      reset_type: "reset_literal"
+
+  "10a":
+    name: "10a_Single_Qubit_Randomized_Benchmarking"
+    script: "10a_Single_Qubit_Randomized_Benchmarking.py"
+    flux_behavior: "joint"
+    defaults:
+      use_state_discrimination: true
+      readout_mode: "ge"
+      use_strict_timing: false
+      num_random_sequences: 80
+      num_averages: 50
+      max_circuit_depth: 800
+      delta_clifford: 40
+      seed: null
+      reset_type_thermal_or_active: "thermal"
+      flux_point_joint_or_independent: "joint"
+      simulate: false
+      simulation_duration_ns: 2500
+      timeout: 100
+      load_data_id: null
+      multiplexed: true
+    allowed_parameters:
+      qubits: "qubit_list"
+      use_state_discrimination: "bool"
+      readout_mode: "readout_mode_literal"
+      use_strict_timing: "bool"
+      num_random_sequences: "positive_int"
+      num_averages: "positive_int"
+      max_circuit_depth: "positive_int"
+      delta_clifford: "positive_int"
+      seed: "optional_int"
+      reset_type_thermal_or_active: "rb_reset_literal"
+      flux_point_joint_or_independent: "joint_literal"
+      simulate: "bool"
+      simulation_duration_ns: "positive_int"
+      timeout: "positive_int"
+      load_data_id: "optional_positive_int"
+      multiplexed: "bool"
+
+  "05st":
+    name: "05st_T1_histogram"
+    script_root: "side_project"
+    script: "StatisticsMustDo/05st_T1_statics.py"
+    flux_behavior: "joint"
+    defaults:
+      num_averages: 150
+      min_wait_time_in_ns: 16
+      max_wait_time_in_ns: 200000
+      flux_point_joint_or_independent_or_arbitrary: "joint"
+      reset_type: "thermal"
+      time_scale: "log"
+      use_state_discrimination: true
+      simulate: false
+      simulation_duration_ns: 2500
+      timeout: 100
+      load_data_id: null
+      multiplexed: true
+      histo_num: 100
+    allowed_parameters:
+      qubits: "qubit_list"
+      num_averages: "positive_int"
+      min_wait_time_in_ns: "positive_int"
+      max_wait_time_in_ns: "positive_int"
+      flux_point_joint_or_independent_or_arbitrary: "joint_literal"
+      reset_type: "reset_literal"
+      time_scale: "log_lin_literal"
+      use_state_discrimination: "bool"
+      simulate: "bool"
+      simulation_duration_ns: "positive_int"
+      timeout: "positive_int"
+      load_data_id: "optional_positive_int"
+      multiplexed: "bool"
+      histo_num: "positive_int"
+
+  "06st_t2star":
+    name: "06st_T2star_histogram"
+    script_root: "side_project"
+    script: "StatisticsMustDo/06st_T2star_statics.py"
+    flux_behavior: "joint"
+    defaults:
+      num_averages: 2000
+      frequency_detuning_in_mhz: 0.3
+      min_wait_time_in_ns: 16
+      max_wait_time_in_ns: 20000
+      flux_point_joint_or_independent_or_arbitrary: "joint"
+      simulate: false
+      timeout: 100
+      use_state_discrimination: true
+      time_scale: "linear"
+      reset_type: "thermal"
+      load_data_id: null
+      multiplexed: true
+      histo_num: 100
+    allowed_parameters:
+      qubits: "qubit_list"
+      num_averages: "positive_int"
+      frequency_detuning_in_mhz: "positive_number"
+      min_wait_time_in_ns: "positive_int"
+      max_wait_time_in_ns: "positive_int"
+      flux_point_joint_or_independent_or_arbitrary: "joint_literal"
+      simulate: "bool"
+      timeout: "positive_int"
+      use_state_discrimination: "bool"
+      time_scale: "linear_log_literal"
+      reset_type: "reset_literal"
+      load_data_id: "optional_positive_int"
+      multiplexed: "bool"
+      histo_num: "positive_int"
+
+  "06st_t2e":
+    name: "06st_T2e_histogram"
+    script_root: "side_project"
+    script: "StatisticsMustDo/06st_T2e_statics.py"
+    flux_behavior: "joint"
+    defaults:
+      num_averages: 1000
+      min_wait_time_in_ns: 16
+      max_wait_time_in_ns: 30000
+      flux_point_joint_or_independent_or_arbitrary: "joint"
+      simulate: false
+      timeout: 100
+      use_state_discrimination: true
+      time_scale: "log"
+      reset_type: "thermal"
+      multiplexed: true
+      load_data_id: null
+      histo_num: 100
+    allowed_parameters:
+      qubits: "qubit_list"
+      num_averages: "positive_int"
+      min_wait_time_in_ns: "positive_int"
+      max_wait_time_in_ns: "positive_int"
+      flux_point_joint_or_independent_or_arbitrary: "joint_literal"
+      simulate: "bool"
+      timeout: "positive_int"
+      use_state_discrimination: "bool"
+      time_scale: "log_lin_literal"
+      reset_type: "reset_literal"
+      multiplexed: "bool"
+      load_data_id: "optional_positive_int"
+      histo_num: "positive_int"
