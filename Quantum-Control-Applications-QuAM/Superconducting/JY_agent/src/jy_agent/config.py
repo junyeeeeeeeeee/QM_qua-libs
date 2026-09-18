@@ -79,6 +79,11 @@ class Settings:
         "恢复",
         "Recover",
     )
+    measurement_resume_phrases: tuple[str, ...] = (
+        "恢復量測",
+        "恢复量测",
+        "Resume measurement",
+    )
     approval_transport: str = "local"
     approval_host: str = "127.0.0.1"
     approval_port: int = 8766
@@ -94,7 +99,7 @@ class Settings:
     def load(cls, agent_root: Path | None = None) -> "Settings":
         root = (agent_root or Path(__file__).resolve().parents[2]).resolve()
         raw = _load_yaml(root / "config" / "agent.yaml")
-        qualibrate_config_path = _resolve_qualibrate_config_path()
+        qualibrate_config_path = (Path.home() / ".qualibrate" / "config.toml").resolve()
         qualibrate_raw = _load_toml(qualibrate_config_path)
 
         quam = _mapping(qualibrate_raw, "quam")
@@ -214,6 +219,13 @@ class Settings:
             interaction.get("recovery_phrases", ["恢復", "Recover"]),
             "interaction.recovery_phrases",
         )
+        measurement_resume_phrases = _string_tuple(
+            interaction.get(
+                "measurement_resume_phrases",
+                ["恢復量測", "恢复量测", "Resume measurement"],
+            ),
+            "interaction.measurement_resume_phrases",
+        )
         shutdown_phrases = _string_tuple(
             interaction.get(
                 "measurement_mode_shutdown_phrases",
@@ -268,6 +280,7 @@ class Settings:
             measurement_mode_entry_phrases=measurement_entry_phrases,
             autonomy_mode_entry_phrases=autonomy_entry_phrases,
             recovery_phrases=recovery_phrases,
+            measurement_resume_phrases=measurement_resume_phrases,
             approval_transport=approval_transport,
             approval_host=approval_host,
             approval_port=approval_port,
@@ -334,17 +347,6 @@ class Settings:
     @property
     def lock_path(self) -> Path:
         return self.runtime / "hardware.lock"
-
-
-def _resolve_qualibrate_config_path() -> Path:
-    override = os.environ.get("QUALIBRATE_CONFIG_FILE")
-    if override:
-        candidate = Path(override).expanduser()
-        if candidate.is_dir():
-            candidate = candidate / "config.toml"
-    else:
-        candidate = Path.home() / ".qualibrate" / "config.toml"
-    return candidate.resolve()
 
 
 def _external_path(value: str, config_parent: Path) -> Path:

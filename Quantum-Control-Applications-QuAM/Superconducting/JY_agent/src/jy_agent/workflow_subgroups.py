@@ -9,6 +9,8 @@ from .workflow_02c import resolve_02c_targets
 
 SUBGROUP_NODES = frozenset(
     {
+        "02x",
+        "02a",
         "02c",
         "03a",
         "04",
@@ -22,15 +24,25 @@ SUBGROUP_NODES = frozenset(
         "06st_t2e",
     }
 )
-# These calibration nodes share one fixed multiplex sweep definition.  A retry
-# may widen/refine the sweep, but it must not silently turn into a target-local
-# run because the calibration script and evidence are interpreted as one batch.
-FIXED_TARGET_NODES = frozenset({"02x", "02a"})
-DEFAULT_03A_MIN_ROBUST_SNR = 10.0
+# Retained as an empty set for import compatibility. Every calibration node now
+# follows shared-first-batch then unresolved-subgroup retry; no node silently
+# expands a target-local retry back to the full workflow set.
+FIXED_TARGET_NODES: frozenset[str] = frozenset()
+# First completed run of these nodes must multiplex every currently-active
+# target with the same parameters. Later retries must omit already-resolved
+# qubits and should still group any remaining unresolved qubits that can
+# share the recovery settings. 03a keeps its own first-coarse-all-targets
+# gate. Statistics nodes may split earlier when wait windows are incompatible.
+SHARED_FIRST_BATCH_NODES = frozenset(
+    {"02x", "02a", "02c", "04", "05", "07b", "06", "06b", "10a"}
+)
+DEFAULT_02X_MIN_ROBUST_SNR = 3.0
+DEFAULT_02A_MIN_ROBUST_SNR = 3.0
+DEFAULT_03A_MIN_ROBUST_SNR = 6.0
 DEFAULT_03A_MIN_EDGE_FRACTION = 0.05
 DEFAULT_03A_MAX_NOISE_CONFIRMATION_AVERAGES = 2000
 DEFAULT_03A_FINAL_MIN_FWHM_HZ = 500_000.0
-DEFAULT_03A_FINAL_MAX_FWHM_HZ = 10_000_000.0
+DEFAULT_03A_FINAL_MAX_FWHM_HZ = 16_000_000.0
 DEFAULT_04_MIN_ROBUST_SNR = 14.0
 DEFAULT_05_MIN_ROBUST_SNR = 25.0
 
@@ -41,6 +53,10 @@ def resolve_node_targets(
     min_03a_snr: float = DEFAULT_03A_MIN_ROBUST_SNR,
     min_04_snr: float = DEFAULT_04_MIN_ROBUST_SNR,
     min_05_snr: float = DEFAULT_05_MIN_ROBUST_SNR,
+    min_03a_fwhm_hz: float = DEFAULT_03A_FINAL_MIN_FWHM_HZ,
+    max_03a_fwhm_hz: float = DEFAULT_03A_FINAL_MAX_FWHM_HZ,
+    min_02x_snr: float = DEFAULT_02X_MIN_ROBUST_SNR,
+    min_02a_snr: float = DEFAULT_02A_MIN_ROBUST_SNR,
 ) -> set[str]:
     """Return targets with final per-qubit evidence for one node."""
     rows = list(run_rows)
@@ -54,6 +70,8 @@ def resolve_node_targets(
             rows,
             require_fine=True,
             min_snr=min_03a_snr,
+            min_fwhm_hz=min_03a_fwhm_hz,
+            max_fwhm_hz=max_03a_fwhm_hz,
         )
     return _resolve_usable_targets(
         node_id,
@@ -62,6 +80,10 @@ def resolve_node_targets(
         min_03a_snr=min_03a_snr,
         min_04_snr=min_04_snr,
         min_05_snr=min_05_snr,
+        min_03a_fwhm_hz=min_03a_fwhm_hz,
+        max_03a_fwhm_hz=max_03a_fwhm_hz,
+        min_02x_snr=min_02x_snr,
+        min_02a_snr=min_02a_snr,
     )
 
 
@@ -80,6 +102,8 @@ def _resolve_03a_targets(
     *,
     require_fine: bool,
     min_snr: float,
+    min_fwhm_hz: float = DEFAULT_03A_FINAL_MIN_FWHM_HZ,
+    max_fwhm_hz: float = DEFAULT_03A_FINAL_MAX_FWHM_HZ,
 ) -> set[str]:
     resolved: set[str] = set()
     for row in rows:
@@ -89,6 +113,8 @@ def _resolve_03a_targets(
                 [row],
                 require_fine_03a=require_fine,
                 min_03a_snr=min_snr,
+                min_03a_fwhm_hz=min_fwhm_hz,
+                max_03a_fwhm_hz=max_fwhm_hz,
             )
         )
         if row.get("decision") == "manual_review":
@@ -160,6 +186,10 @@ def _resolve_usable_targets(
     min_03a_snr: float,
     min_04_snr: float = DEFAULT_04_MIN_ROBUST_SNR,
     min_05_snr: float = DEFAULT_05_MIN_ROBUST_SNR,
+    min_03a_fwhm_hz: float = DEFAULT_03A_FINAL_MIN_FWHM_HZ,
+    max_03a_fwhm_hz: float = DEFAULT_03A_FINAL_MAX_FWHM_HZ,
+    min_02x_snr: float = DEFAULT_02X_MIN_ROBUST_SNR,
+    min_02a_snr: float = DEFAULT_02A_MIN_ROBUST_SNR,
 ) -> set[str]:
     resolved: set[str] = set()
     for row in rows:
@@ -175,14 +205,23 @@ def _resolve_usable_targets(
         ):
             continue
         results = analysis.get("fit_quality", {}).get("results", {})
+        # Resonator analysis may intentionally omit structured fit results and
+        # rely on the per-qubit sweep metrics as its authoritative evidence.
+        if results is None and node_id in {"02x", "02a"}:
+            results = {}
         metrics = analysis.get("dataset_metrics", {}).get("qubits", {})
         if not isinstance(results, dict) or not isinstance(metrics, dict):
             continue
-        for name, fit in results.items():
+        names = set(results) | {
+            str(name) for name in metrics if isinstance(name, str)
+        }
+        for name in names:
+            fit = results.get(name, {})
             if not isinstance(fit, dict):
                 continue
             if not _fit_is_usable(node_id, fit):
                 continue
+            evidence = metrics.get(name)
             if node_id in {
                 "07b",
                 "06",
@@ -194,7 +233,6 @@ def _resolve_usable_targets(
             }:
                 resolved.add(str(name))
                 continue
-            evidence = metrics.get(name)
             if node_id == "05":
                 if _snr_evidence_is_usable(evidence, min_05_snr):
                     resolved.add(str(name))
@@ -206,12 +244,14 @@ def _resolve_usable_targets(
                     else None
                 )
                 if not _finite(width) or not (
-                    DEFAULT_03A_FINAL_MIN_FWHM_HZ
+                    float(min_03a_fwhm_hz)
                     <= float(width)
-                    <= DEFAULT_03A_FINAL_MAX_FWHM_HZ
+                    <= float(max_03a_fwhm_hz)
                 ):
                     continue
             min_snr = {
+                "02x": min_02x_snr,
+                "02a": min_02a_snr,
                 "03a": min_03a_snr,
                 "04": min_04_snr,
                 "05": min_05_snr,
@@ -223,6 +263,20 @@ def _resolve_usable_targets(
 
 
 def _fit_is_usable(node_id: str, fit: dict[str, Any]) -> bool:
+    if node_id in {"02x", "02a"}:
+        if fit.get("fit_successful") is False:
+            return False
+        for key in (
+            "RO_frequency",
+            "frequency",
+            "resonance_frequency",
+            "freq",
+        ):
+            if _finite(fit.get(key)):
+                return True
+        # Resonator nodes may rely on sweep metrics when the protected node
+        # omits a structured frequency field.
+        return True
     if node_id == "03a":
         return fit.get("fit_successful") is True and _finite(
             fit.get("drive_freq")

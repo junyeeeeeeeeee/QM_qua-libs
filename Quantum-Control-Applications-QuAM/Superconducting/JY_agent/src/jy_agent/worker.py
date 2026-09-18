@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import _thread
 import argparse
+import hashlib
 import hmac
 import json
 import os
@@ -35,13 +36,30 @@ def _inspect_node(script_path: Path) -> Any:
     return next(iter(nodes.values()))
 
 
+def _assert_active_state_source(active_state: Path) -> None:
+    from quam_libs.components.quam_root import QuAM
+
+    quam_state_root = QuAM.get_quam_state_path()
+    if quam_state_root is None:
+        raise RuntimeError(
+            "ACTIVE_STATE_SOURCE_MISSING: ~/.qualibrate/config.toml does not "
+            "define quam.state_path"
+        )
+    expected_state = (Path(quam_state_root).expanduser() / "state.json").resolve()
+    actual_state = active_state.expanduser().resolve()
+    if actual_state != expected_state:
+        raise RuntimeError(
+            "ACTIVE_STATE_SOURCE_MISMATCH: JY active state "
+            f"{actual_state} does not match the QuAM.load() source {expected_state}"
+        )
+
+
 def run_request(request_path: Path) -> int:
     request = json.loads(request_path.read_text(encoding="utf-8"))
     database = Database(Path(request["database_path"]))
     run_id = request["run_id"]
     active_state = Path(request["active_state"])
     wiring_path = Path(request["wiring_path"])
-    qualibrate_config_path = Path(request["qualibrate_config_path"])
     lock_path = Path(request["lock_path"])
     recovery_path = Path(request["recovery_state_path"])
     stop_request_path = Path(
@@ -55,10 +73,10 @@ def run_request(request_path: Path) -> int:
     for label, path in (
         ("active state", active_state),
         ("wiring", wiring_path),
-        ("Qualibrate config", qualibrate_config_path),
     ):
         if not path.is_file():
             raise FileNotFoundError(f"Configured {label} file is missing: {path}")
+    _assert_active_state_source(active_state)
     before_hash = sha256_file(active_state)
     recovery_path.parent.mkdir(parents=True, exist_ok=True)
     shutil.copy2(active_state, recovery_path)
@@ -245,17 +263,37 @@ def run_request(request_path: Path) -> int:
         instrument_unreachable = (
             classification.category == "instrument_unreachable"
         )
+        qop_compile_failure = classification.category == "qop_compile_failure"
+        hardware_cleanup_verified = bool(
+            (
+                instrument_unreachable
+                or qop_compile_failure
+            )
+            and classification.safe_to_release_lock
+        )
+        hardware_cleanup_error: str | None = None
+        if (
+            instrument_unreachable
+            and not hardware_cleanup_verified
+            and execution_phase == "hardware_execution"
+        ):
+            hardware_cleanup_verified, hardware_cleanup_error = (
+                _stop_active_node_with_evidence()
+            )
         observed_hash, restored, restore_error = _restore_state_if_changed(
             active_state, recovery_path, before_hash
         )
         after_hash = sha256_file(active_state) if active_state.is_file() else observed_hash
         cleanup_verified = after_hash == before_hash and not restore_error
-        release_after_no_connection = bool(
-            instrument_unreachable
-            and classification.safe_to_release_lock
-            and cleanup_verified
+        release_after_verified_cleanup = bool(
+            cleanup_verified
+            and hardware_cleanup_verified
+            and (
+                instrument_unreachable
+                or (qop_compile_failure and classification.safe_to_release_lock)
+            )
         )
-        if release_after_no_connection:
+        if release_after_verified_cleanup:
             release_lock = True
             recovery_path.unlink(missing_ok=True)
         termination_cause = (
@@ -282,18 +320,20 @@ def run_request(request_path: Path) -> int:
             "failure_category": classification.category,
             "execution_phase": execution_phase,
             "measurement_paused": instrument_unreachable,
+            "hardware_cleanup_verified": hardware_cleanup_verified,
+            "hardware_cleanup_error": hardware_cleanup_error,
             "hardware_lock_recovery_required": (
-                instrument_unreachable and not release_after_no_connection
+                instrument_unreachable and not release_after_verified_cleanup
             ),
             "operator_message": {
                 "zh-Hant": (
                     "儀器連線失敗，本次實驗與後續排程已暫停。請檢查 QOP/OPX、"
-                    "儀器電源與實驗室網路；連線恢復後可回 AI 對話重新進入原量測模式。"
+                    "儀器電源與實驗室網路；確認後回 AI 對話輸入「恢復量測」。"
                 ),
                 "en": (
                     "Instrument connectivity failed, so this experiment and new "
                     "scheduling were paused. Check QOP/OPX, instrument power, and "
-                    "the lab network, then re-enter the same JY mode after connectivity returns."
+                    "the lab network, then enter 'Resume measurement' in the AI conversation."
                 ),
             }
             if instrument_unreachable
@@ -317,7 +357,7 @@ def run_request(request_path: Path) -> int:
                 database,
                 run_id=run_id,
                 workflow_id=request["workflow_id"],
-                lock_retained=not release_after_no_connection,
+                lock_retained=not release_after_verified_cleanup,
             )
         database.event(
             "instrument_error_paused" if instrument_unreachable else "run_failed",
@@ -327,7 +367,8 @@ def run_request(request_path: Path) -> int:
                 "error": str(exc),
                 "active_state_restored": restored,
                 "failure_category": classification.category,
-                "hardware_lock_retained": not release_after_no_connection,
+                "hardware_cleanup_verified": hardware_cleanup_verified,
+                "hardware_lock_retained": not release_lock,
             },
             request["workflow_id"],
         )
@@ -336,22 +377,35 @@ def run_request(request_path: Path) -> int:
         return 1
     finally:
         worker_done.set()
+        receipt = {
+            "run_id": run_id,
+            "status": final_status,
+            "exit_code": exit_code,
+            "termination_cause": termination_cause,
+            "stop_intent": stop_details.get("intent"),
+            "stop_requested_at": stop_details.get("requested_at"),
+            "cleanup_verified": cleanup_verified,
+            "hardware_cleanup_verified": locals().get(
+                "hardware_cleanup_verified", cleanup_verified
+            ),
+            "hardware_cleanup_error": locals().get("hardware_cleanup_error"),
+            "lock_release_authorized": release_lock,
+            "lock_released": False,
+            "finished_at": utc_now(),
+        }
+        _write_signed_exit_receipt(
+            exit_receipt_path,
+            receipt,
+            str(request.get("process_token") or ""),
+        )
         if release_lock:
             release_worker_lock(lock_path, run_id)
-        lock_released = not lock_path.exists()
-        atomic_write_json(
+        receipt["lock_released"] = not lock_path.exists()
+        receipt["finished_at"] = utc_now()
+        _write_signed_exit_receipt(
             exit_receipt_path,
-            {
-                "run_id": run_id,
-                "status": final_status,
-                "exit_code": exit_code,
-                "termination_cause": termination_cause,
-                "stop_intent": stop_details.get("intent"),
-                "stop_requested_at": stop_details.get("requested_at"),
-                "cleanup_verified": cleanup_verified,
-                "lock_released": lock_released,
-                "finished_at": utc_now(),
-            },
+            receipt,
+            str(request.get("process_token") or ""),
         )
 
 
@@ -435,6 +489,47 @@ def _persist_recovery_checkpoint(
         },
         workflow_id,
     )
+
+
+def _stop_active_node_with_evidence() -> tuple[bool, str | None]:
+    """Stop the recorded active node; absence is not accepted as cleanup proof."""
+
+    try:
+        from qualibrate import QualibrationNode
+
+        active_node = QualibrationNode.active_node
+        if active_node is None:
+            return False, "QualibrationNode.active_node is unavailable"
+        active_node.stop()
+        return True, None
+    except Exception as exc:
+        return False, f"{type(exc).__name__}: {exc}"
+
+
+def _write_signed_exit_receipt(
+    path: Path,
+    payload: dict[str, Any],
+    process_token: str,
+) -> None:
+    if not process_token:
+        raise RuntimeError("Worker cannot sign an exit receipt without its process token")
+    unsigned = dict(payload)
+    unsigned.pop("worker_signature", None)
+    canonical = json.dumps(
+        unsigned,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    signed = {
+        **unsigned,
+        "worker_signature": hmac.new(
+            process_token.encode("utf-8"),
+            canonical,
+            hashlib.sha256,
+        ).hexdigest(),
+    }
+    atomic_write_json(path, signed)
 
 
 def _restore_state_if_changed(

@@ -251,7 +251,18 @@ class PolicyEngine:
     ) -> None:
         qubits = parameters["qubits"]
         if node_id in {"02x", "02a", "02c"}:
-            span_hz = float(parameters["frequency_span_in_mhz"]) * 1e6
+            span_mhz = float(parameters["frequency_span_in_mhz"])
+            resonator_rules = self.raw.get("analysis", {}).get("resonator", {})
+            max_span_mhz = float(resonator_rules.get("max_frequency_span_mhz", 60.0))
+            exclusion_hz = float(
+                resonator_rules.get("upconverter_exclusion_hz", 1_000_000.0)
+            )
+            if span_mhz > max_span_mhz:
+                raise PolicyError(
+                    f"frequency_span_in_mhz {span_mhz:g} exceeds the resonator "
+                    f"policy maximum of {max_span_mhz:g} MHz"
+                )
+            span_hz = span_mhz * 1e6
             limit = float(self.limits["resonator_if_abs_hz"])
             for name in qubits:
                 current_if = state["qubits"][name]["resonator"]["intermediate_frequency"]
@@ -260,6 +271,12 @@ class PolicyEngine:
                 if abs(float(current_if)) + span_hz / 2 > limit:
                     raise PolicyError(
                         f"{name} resonator sweep exceeds ±{limit / 1e6:g} MHz IF"
+                    )
+                if abs(float(current_if)) <= span_hz / 2 + exclusion_hz:
+                    raise PolicyError(
+                        f"{name} resonator sweep includes the readout "
+                        "upconverter frequency; reduce frequency_span_in_mhz or "
+                        "move resonator IF farther from the LO"
                     )
 
         if node_id == "02c":
@@ -274,6 +291,19 @@ class PolicyEngine:
                 raise PolicyError("max_amp cannot exceed normalized amplitude 1")
             if parameters["num_power_points"] > self.limits["max_sweep_points"]:
                 raise PolicyError("num_power_points exceeds the sweep-point limit")
+            resonator_02c = self.raw.get("analysis", {}).get("02c", {})
+            max_power_points = int(resonator_02c.get("max_num_power_points", 30))
+            max_averages = int(resonator_02c.get("max_num_averages", 100))
+            if int(parameters["num_power_points"]) > max_power_points:
+                raise PolicyError(
+                    f"num_power_points {parameters['num_power_points']} exceeds "
+                    f"the 02c policy maximum of {max_power_points}"
+                )
+            if int(parameters["num_averages"]) > max_averages:
+                raise PolicyError(
+                    f"num_averages {parameters['num_averages']} exceeds "
+                    f"the 02c policy maximum of {max_averages}"
+                )
 
         if node_id == "03a":
             span_hz = float(parameters["frequency_span_in_mhz"]) * 1e6

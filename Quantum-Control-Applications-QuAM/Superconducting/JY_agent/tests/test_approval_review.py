@@ -1,13 +1,11 @@
 from __future__ import annotations
 
 import asyncio
-import hashlib
 import json
 import tempfile
 import unittest
 from dataclasses import replace
 from pathlib import Path
-from urllib.parse import urlencode
 
 from starlette.requests import Request
 from starlette.testclient import TestClient
@@ -104,17 +102,8 @@ class ApprovalReviewTests(unittest.TestCase):
             settings.runtime.mkdir(parents=True, exist_ok=True)
             token_path = settings.runtime / "public-dashboard-access.token"
             token_path.write_text("a" * 64, encoding="ascii")
-            bootstrap_path = settings.runtime / "public-dashboard-bootstrap.json"
-            bootstrap_path.write_text(
-                json.dumps(
-                    {
-                        "code": "b" * 64,
-                        "expires_at": "2999-01-01T00:00:00.1234567+00:00",
-                        "used": False,
-                    }
-                ),
-                encoding="utf-8",
-            )
+            password_path = settings.runtime / "dashboard-password.txt"
+            password_path.write_text("shared-lab-password", encoding="utf-8")
             (settings.runtime / "server-bootstrap.json").write_text(
                 json.dumps(
                     {
@@ -123,7 +112,7 @@ class ApprovalReviewTests(unittest.TestCase):
                         "approval_port": 8766,
                         "public_base_url": "https://jy-public.example.com",
                         "approval_access_token_path": str(token_path),
-                        "approval_bootstrap_code_path": str(bootstrap_path),
+                        "dashboard_password_path": str(password_path),
                         "public_tunnel_pid": 123,
                     }
                 ),
@@ -137,13 +126,11 @@ class ApprovalReviewTests(unittest.TestCase):
             )
             self.assertEqual(
                 service.session_dashboard_url("session-id"),
-                "https://jy-public.example.com/?bootstrap_code="
-                + "b" * 64,
+                "https://jy-public.example.com/",
             )
             self.assertEqual(
                 service.session_results_url("session-id"),
-                "https://jy-public.example.com/session/session-id/results?bootstrap_code="
-                + "b" * 64,
+                "https://jy-public.example.com/session/session-id/results",
             )
 
             bootstrap = json.loads(
@@ -160,7 +147,7 @@ class ApprovalReviewTests(unittest.TestCase):
                 service.browser_approval_origin, "http://127.0.0.1:8766"
             )
 
-    def test_public_dashboard_requires_private_link_then_uses_secure_cookie(self) -> None:
+    def test_public_dashboard_requires_password_then_uses_secure_cookie(self) -> None:
         with tempfile.TemporaryDirectory() as folder:
             settings = replace(
                 make_settings(Path(folder), sample_state(0.2, 0.1)),
@@ -170,47 +157,39 @@ class ApprovalReviewTests(unittest.TestCase):
             )
             settings.validate_approval_transport()
             settings.runtime.mkdir(parents=True, exist_ok=True)
-            (settings.runtime / "public-dashboard-bootstrap.json").write_text(
-                json.dumps(
-                    {
-                        "code_sha256": hashlib.sha256(
-                            ("b" * 64).encode("utf-8")
-                        ).hexdigest(),
-                        "expires_at": "2999-01-01T00:00:00.1234567+00:00",
-                        "used": False,
-                    }
-                ),
-                encoding="utf-8",
+            password = "shared-lab-password"
+            (settings.runtime / "dashboard-password.txt").write_text(
+                password, encoding="utf-8"
             )
             app = create_approval_app(settings)
             with TestClient(app, base_url="https://jy-public.example.com") as client:
-                refused = client.get("/healthz")
-                self.assertEqual(refused.status_code, 403)
+                refused = client.get("/healthz", follow_redirects=False)
+                self.assertEqual(refused.status_code, 303)
+                self.assertTrue(refused.headers["location"].startswith("/login?"))
                 forged_host = client.get(
-                    "/healthz", headers={"Host": "127.0.0.1:8766"}
+                    "/healthz",
+                    headers={"Host": "127.0.0.1:8766"},
+                    follow_redirects=False,
                 )
-                self.assertEqual(forged_host.status_code, 403)
-                admitted = client.get(
-                    "/healthz?bootstrap_code=" + "b" * 64,
+                self.assertEqual(forged_host.status_code, 303)
+                admitted = client.post(
+                    "/login",
+                    data={"password": password, "next": "/healthz"},
                     follow_redirects=False,
                 )
                 self.assertEqual(admitted.status_code, 303)
-                self.assertNotIn("bootstrap_code", admitted.headers["location"])
+                self.assertEqual(admitted.headers["location"], "/healthz")
+                self.assertTrue(client.cookies.get("jy_dashboard_access"))
                 health = client.get("/healthz")
                 self.assertEqual(health.status_code, 200)
-                consumed = json.loads(
-                    (
-                        settings.runtime / "public-dashboard-bootstrap.json"
-                    ).read_text(encoding="utf-8")
-                )
-                self.assertTrue(consumed["used"])
-                self.assertNotIn("code", consumed)
-            with TestClient(app, base_url="https://jy-public.example.com") as replay:
-                replayed = replay.get(
-                    "/healthz?bootstrap_code=" + "b" * 64,
+            with TestClient(app, base_url="https://jy-public.example.com") as invalid:
+                rejected = invalid.post(
+                    "/login",
+                    data={"password": "incorrect-password", "next": "/"},
                     follow_redirects=False,
                 )
-                self.assertEqual(replayed.status_code, 403)
+                self.assertEqual(rejected.status_code, 401)
+                self.assertIsNone(invalid.cookies.get("jy_dashboard_access"))
 
     def test_review_service_exposes_no_mcp_route(self) -> None:
         with tempfile.TemporaryDirectory() as folder:
@@ -219,7 +198,9 @@ class ApprovalReviewTests(unittest.TestCase):
             )
             paths = {route.path for route in app.routes}
             self.assertIn("/", paths)
-            self.assertIn("/device-pair", paths)
+            self.assertIn("/login", paths)
+            self.assertIn("/logout", paths)
+            self.assertNotIn("/device-pair", paths)
             self.assertIn("/approve/{proposal_id}", paths)
             self.assertIn(
                 "/approve/{proposal_id}/assets/{asset_index:int}", paths

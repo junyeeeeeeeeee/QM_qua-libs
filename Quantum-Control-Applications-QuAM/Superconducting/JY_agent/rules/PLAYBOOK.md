@@ -28,7 +28,14 @@
    token-protected public HTTPS URL; never replace it with a guessed URL.
    Preserve the same top-level `/` entry for the workflow/service lifetime. It
    links to Home, Approval, and Results & controls; every run remains in the
-   numbered dropdown until shutdown.
+   numbered dropdown until shutdown. When ending a turn in measurement mode,
+   copy `operator_handoff.chat` as a three-item markdown list, never as one
+   paragraph, so the operator always sees what to do next, which exact phrase
+   to send afterwards, and the shutdown hint. Successful
+   entry shows only `browser_url`. After the operator sends `已核准`, the first
+   line of the next reply is exactly `已核准`. A live turn may execute
+   `結束量測` directly; a paused or disconnected turn needs Dashboard Home
+   shutdown first, then `結束量測` to verify.
 5. Never write `state.json` directly. Derive a JSON patch, explain each change,
    and apply it only through the lease's passing-evidence state-commit tool.
 6. After every terminal run and deterministic analysis, directly embed every
@@ -49,7 +56,15 @@
 
 The default sequence is:
 
-`02x → 02a → 02c → 03a → 04 → 05 → 07b → 06 → 06b → 10a → 05st → 06st_t2star → 06st_t2e`
+`02x → 02c → 02a → 03a → 04 → 05 → 07b → 06 → 06b → 10a → 05st → 06st_t2star → 06st_t2e`
+
+The operator places already-correct resonator frequencies in `state.json`
+before entry. Resonator spectroscopy (`02x`, `02c`, `02a`) only fine-tunes
+those values; it is not a wide search. Keep `frequency_span_in_mhz` at most
+60 MHz. The protected-node fitter will treat the readout
+`upconverter_frequency` (IF = 0, equivalently detuning `−IF` from the stored
+resonator RF) as a false resonance if that frequency falls inside the sweep,
+so never widen a window until it includes the LO.
 
 `06b` is mandatory and runs immediately after `06` in the default workflow.
 
@@ -116,17 +131,24 @@ the lock survives in recovery quarantine and the next Ensure is local-only.
 - `02x` and `02a` retain their hardcoded minimum-flux behavior.
 - `02c`, `03a`, `04`, and `05` must use `joint`.
 - Stay within the server-returned policy limits. For 03a, the full sweep must
-  stay inside the ±400 MHz qubit IF range.
+  stay inside the ±400 MHz qubit IF range. For `02x`, `02c`, and `02a`,
+  `frequency_span_in_mhz` must stay at most 60 MHz and the IF window must not
+  include the readout `upconverter_frequency`.
 - If x180 is missing or zero before 03a/04/05, call `jy_request_bootstrap`.
   Bootstrap x180 is `0.5 × max_x180_wf_amplitude`; a missing/zero x90 is set
   to `x180 / 2`. Never overwrite an existing nonzero x180 or x90.
 
 ### Multiplex workflows
 
-To measure a fixed target set concurrently inside every node, start the workflow
-with `initial_parameters: {"multiplexed": true}`. The server then forces
-`multiplexed=true` on every run proposal and refuses attempts to disable it.
-For the q3–q8 profile, use the exact targets
+Phrase-only entry (`進入 JY 量測模式` or `進入 JY 自動量測模式` with no extra
+fields) creates a new workflow from `state.json` `active_qubit_names` and
+defaults `multiplexed=true`. The server then forces `multiplexed=true` on every
+run proposal and refuses attempts to disable it. Set the intended qubits in
+`active_qubit_names` before entering; do not ask the operator to type `target`
+or `multiplex` in chat. Explicit `targets` or `multiplexed=false` remain
+optional overrides for tests and special cases.
+
+For the q3–q8 profile, `active_qubit_names` should be
 `["q3", "q4", "q5", "q6", "q7", "q8"]`.
 
 Before creating the workflow or a run proposal, server policy validates target
@@ -135,55 +157,108 @@ amplitude. Multiplexing applies to the qubits within one node; calibration nodes
 still execute one at a time with a separate approval decision and analysis for
 each, all displayed on the same session Dashboard.
 
+Minimize the number of hardware runs. The first attempt of every node must
+measure all currently-active workflow targets together with one shared parameter
+set. Do not start a node by measuring one qubit at a time. If only some qubits
+fail, retry those unresolved qubits together with the same modified parameters
+and omit already-resolved targets. Split into separate multiplex subgroups only
+when those qubits scientifically cannot share the sweep (different frequency or
+power window, incompatible statistics wait time, or a 03a stage/LO constraint).
+A singleton retry is a last resort after a shared-parameter multiplex retry, not
+the default first action. Scheduling already-resolved targets again is a
+recoverable planning error: the server rejects the request without hard-stopping
+an active autonomy lease.
+
 ## Node decisions
 
 ### 02x — bare resonator spectroscopy
 
-Advance only when every target has a visible resonator feature, adequate robust
-SNR, and the feature is not at a sweep edge. Repeat with a wider span if the
-feature is clipped; increase averages or adjust the step when the trace is noisy.
-The protected node records `extras/bare_resonator_freq`; if that key is absent,
-initialize it to the qubit's current resonator RF frequency through a separately
-approved state-commit proposal before running 02x.
+`02x` only fine-tunes the operator-supplied resonator RF, typically by a few
+MHz. Start from `state.json` and the 20 MHz default; do not treat 02x as a
+search over tens of MHz. Advance only when every target has a visible resonator
+feature, robust SNR of at least 3, and the feature is not at a sweep edge and is
+not the readout `upconverter_frequency`. If a feature is clipped, recenter the
+stored RF or take a small span increase still at most 60 MHz; never widen until
+the LO/upconverter lies inside the window. Increase averages or adjust the step
+when the trace is noisy. The protected node records
+`extras/bare_resonator_freq`; if that key is absent, initialize it to the
+qubit's current resonator RF frequency through a separately approved
+state-commit proposal before running 02x. The first 02x run must multiplex every
+active target. Passing qubits accumulate; retry only unresolved targets that can
+share the same span/averages change. After every active target is resolved,
+advance to `02c`.
 
 ### 02a — dressed resonator spectroscopy
 
-Advance when the dressed resonance is resolved for every target and the proposed
-frequency change is finite and within IF limits. Repeat with a recentered or wider
-sweep if the feature is at an edge. In bounded autonomy, 02a remains a fixed
-multiplex batch: a retry motivated by one target must still run every workflow
-target. The service normalizes a target-local `qubits` request to the full
-authorized workflow target set and records the adjustment. If the lease itself
-covers only a subgroup, create a new bounded lease covering all workflow targets;
-the rejected request must not touch hardware or halt the existing lease.
+`02a` runs after `02c`. It is only a simple dressed-frequency scan around the
+already tracked resonator, not a power-dependent or wide search. Keep the span
+at the 20 MHz default unless a few-MHz recenter is required, and never exceed
+60 MHz. Advance when the dressed resonance is resolved for every target, the
+feature is not the upconverter, robust SNR is at least 3, and the proposed
+frequency change is finite and within IF limits. If a feature is at an edge,
+recenter rather than opening a window that includes IF = 0. In bounded autonomy,
+the first 02a run must multiplex every active target with the same sweep. Passing
+qubits accumulate across runs; retry only unresolved targets that can share the
+same span/averages change, and never remeasure an already-resolved target.
+After a
+passing 02a, advance to `03a`.
 
 ### 02c — resonator spectroscopy versus amplitude
 
+`02c` runs immediately after `02x` and before the simple dressed scan `02a`.
 Validate the tracked resonator frequency as power increases from low power
-(more-negative dBm) to high power. The low-power tail must form a stable
-`dressed frequency` plateau, and the high-power tail must form a separate stable
-`bare frequency` plateau. The intermediate `depletion region` must contain
-frequencies between those plateaus and move predominantly from dressed toward
-bare as power increases (equivalently, toward dressed as power decreases).
+(more-negative dBm) to high power. The low power end shows the
+`dressed frequency` and the high power end shows the `bare frequency`.
 
-The target readout power is the highest power that still belongs to the dressed
-plateau. JY's deterministic plateau analysis is authoritative for the proposed
-frequency and power; the protected node's derivative-threshold fit is advisory
-and must be ignored when it is empty or disagrees with the dressed boundary.
-Missing or edge-clipped plateaus, too few depletion points, or a non-monotonic
-transition still require repeat or manual review.
+A run passes when those two frequencies can be told apart: they are separated by
+at least the configured frequency distance, each is observed on at least
+`min_classified_plateau_points` consecutive classifiable power points, and
+neither sits within 5% of a frequency-sweep edge. The power segment in between,
+where a point is neither clearly dressed nor clearly bare, is discarded rather
+than judged. Plateau stability, plateau width, depletion-point count, and
+transition monotonicity are reported as advisory notes and no longer reject a
+run on their own; re-enable one through its `require_*` rule in `policies.yaml`
+if a target needs the stricter gate.
 
-An 02c retry may measure any non-empty subset of the workflow targets while
-preserving `multiplexed: true`. Use separate subgroups when qubits need different
-frequency or power ranges (for example q3-q5 and q1-q2), and do not advance to
-03a until every original target has either a valid dressed point or satisfies
-the strict bare-only absence rule.
+The target readout power is the highest power that is still classified as
+dressed, taken from the usable low-power part of the trace. It is deliberately
+not pushed to the last point before punch-out. JY's deterministic analysis is
+authoritative for the proposed frequency and power; the protected node's
+derivative-threshold fit is advisory and must be ignored when it is empty or
+disagrees with the dressed boundary.
+
+02c fails only when dressed and bare still cannot be told apart after the
+parameters have been driven to their policy limits — the frequency window up to
+60 MHz (excluding the readout `upconverter_frequency`) and `num_averages` at
+100. Missing, edge-clipped, or inseparable frequencies below those limits mean
+widen the window or add averages and repeat. At the limits, treat the target as
+manual review or scientifically unmeasurable instead of spending more attempts.
+Never schedule `num_power_points` above 30 or `num_averages` above 100.
+
+When an unresolved target's dressed/bare plateau transition is clipped by the
+frequency-sweep boundary, spans most of the current sweep, or cannot be fully
+contained in the current window, widen `frequency_span_in_mhz` before treating
+the target as scientifically unusable or spending repeated attempts at the same
+span, but stay at or below 60 MHz and never include the readout
+`upconverter_frequency`. Keep qubits together when they can share the same
+frequency and power window. Split only the unresolved qubits that actually need
+a different window, preserve `multiplexed: true`, and reapply the normal
+separability, edge-distance, and state-commit evidence gates to the wider scan.
+Do not repeat an already resolved target merely because another target in the
+same numeric range needs a wider frequency window.
+
+The first 02c run must multiplex every active workflow target with the same
+parameters. An 02c retry may then measure the unresolved subset while preserving
+`multiplexed: true`. Group every qubit that needs the same frequency or power
+change into one retry; do not walk the chip one isolated qubit at a time.
+Do not advance to 02a until every original target has either a valid dressed
+point or satisfies the strict bare-only absence rule.
 
 A qubit may be marked `bare_only_absent` and skipped in every later node only
 when all safeguards pass: the full power trace is a straight line matching the
 previously measured bare frequency, minimum power reaches at least -50 dBm, the
 configured frequency span is at most 10 MHz with step at most 0.1 MHz, at least
-40 power points are present, the bare resonance remains resolved and away from
+30 power points are present, the bare resonance remains resolved and away from
 sweep edges, and either readout integration is at least 1000 ns or
 `num_averages` is at least 200. Every state update still requires a separate
 human-approved state-commit proposal.
@@ -205,7 +280,7 @@ to avoid stepping over a resonance.
 
 Never accept the protected node's fit or success outcome by itself. A coarse peak
 is a credible candidate only when the fit is finite and successful, the feature
-is at least 5% away from either sweep edge, and robust SNR is at least 10. The
+is at least 5% away from either sweep edge, and robust SNR is at least 6. The
 signal prominence must visibly exceed the surrounding noise; multiple noisy
 local extrema are not a candidate even when the node reports a fit. High-power
 coarse runs must not produce a state patch or count as final 03a evidence.
@@ -223,7 +298,7 @@ pair rule only chooses a coarse candidate; the higher-frequency result must
 still pass a separately centered low-power fine scan.
 
 For an unresolved target whose strongest feature is inside the sweep but robust
-SNR is below 10, keep the same LO window and increase `num_averages` through
+SNR is below 6, keep the same LO window and increase `num_averages` through
 500, 1000, and at most 2000 as needed. Do not move its LO before this noise
 confirmation reaches 2000 averages. If no credible peak remains at 2000
 averages, it may move to another LO window. An edge-limited feature may shift
@@ -238,22 +313,31 @@ shift rule. Move that unresolved subgroup to explicitly chosen 100 MHz-grid LO
 centers with IF=0, then repeat the 800 MHz coarse search. Never shift an already
 found target or a shared XY output automatically.
 
-After each target has a credible candidate, lower the drive power and iteratively
-reduce span and step size. Candidate targets may use an intermediate refinement
-stage (for example amplitude factor 0.075) when a direct drop from the coarse
-factor to 0.05 makes a previously reproducible peak disappear. Refinement scans
-never produce a state patch and must still be followed by the final low-power
-scan. A final 03a result requires a span no greater than
-100 MHz, an operation amplitude factor no greater than 0.05, a stable finite
-fit, robust SNR of at least 10, and a feature at least 5% away from either sweep
-edge. Only this fine-scan evidence may update idle frequency or resolve the
-target.
-The final feature FWHM must also lie between 0.5 and 10 MHz. A broader feature is
-still power-broadened and must not resolve the target even when fit and SNR pass;
-reduce `operation_amplitude_factor` and repeat, tightening span and step as
-needed. If the feature becomes narrower than 0.5 MHz, slightly raise amplitude or
-increase resolution before accepting it. Only commit `idle_freq` after the
-measured FWHM falls inside this interval.
+After each target has a credible candidate, lower the drive power and then run a
+centered refinement/fine scan. Candidate targets may use an intermediate
+refinement stage (for example amplitude factor 0.075) when a direct drop from
+the coarse factor to 0.05 makes a previously reproducible peak disappear.
+Refinement scans never produce a state patch and must still be followed by the
+final low-power scan.
+
+Do not chase ever-narrower frequency windows. A final 03a scan does not need a
+40–50 MHz span; about 200 MHz is already fine enough once the LO/IF is centered
+on a credible candidate. Prefer keeping the span near that scale and fixing
+linewidth or morphology with drive amplitude instead. A final 03a result
+requires a span no greater than 200 MHz, an operation amplitude factor no
+greater than 0.05, a stable finite fit, robust SNR of at least 6, and a feature
+at least 5% away from either sweep edge. Only this fine-scan evidence may
+update idle frequency or resolve the target.
+
+The final feature FWHM must also lie between 0.5 and 16 MHz. A still-broader
+feature is power-broadened and must not resolve the target even when fit and SNR
+pass; reduce `operation_amplitude_factor` and repeat at about the same ~200 MHz
+window. If many peaks appear in one window (noisy multiplet or power-split
+structure), lower the amplitude first rather than shrinking the span; weaker
+drive usually collapses the clutter onto the fundamental. If the feature becomes
+narrower than 0.5 MHz, slightly raise amplitude or increase resolution before
+accepting it. Only commit `idle_freq` after the measured FWHM falls inside this
+interval.
 
 Before a candidate's refinement or fine scan, call
 `jy_request_03a_candidate_center` when its stored RF center does not match the
@@ -272,8 +356,10 @@ or fit checks must expose no candidate state patch.
 
 An 03a run may measure any non-empty subset of the active workflow targets while
 preserving `multiplexed: true`. Passing qubits accumulate only under these
-rules. Retry only unresolved qubits, and do not advance to 04 until every active
-target has final fine-scan evidence.
+rules. After the all-target coarse scan, retry unresolved qubits that can share
+the same span, amplitude, and averages together; isolate a qubit only when its
+LO/stage constraint differs. Do not advance to 04 until every active target has
+final fine-scan evidence.
 
 ### 04 — power Rabi
 
@@ -290,10 +376,12 @@ let it override a finite interior Pi fit. A fitted Pi amplitude within 5% of the
 actual sweep boundary is still edge-limited and requires a repeat.
 
 An 04 run may likewise measure any non-empty subset of the active workflow
-targets while preserving `multiplexed: true`. Passing qubits accumulate across
+targets while preserving `multiplexed: true`. The first 04 run must multiplex
+every active target with the same sweep. Passing qubits accumulate across
 runs when the Pi amplitude is finite and nonzero, robust SNR is at least 14, and
-the feature is at least 5% away from either sweep edge. Retry only unresolved
-qubits, and do not advance to 05 until every active target is resolved. This SNR
+the feature is at least 5% away from either sweep edge. Retry unresolved qubits
+that need the same averaging or amplitude-range change together. Do not advance
+to 05 until every active target is resolved. This SNR
 floor is anchored to the accepted q3/q4/q5 reference run (minimum 14.86). If a
 trace is below the floor, call `jy_recommend_0405_snr_retry` and increase only
 that subgroup through 500, 1000, 2000, then 4000 averages.
@@ -307,10 +395,12 @@ requires a repeat with a longer range or adjusted step; every T1 state update
 still requires human approval.
 
 An 05 run may measure any non-empty subset of the active targets while preserving
-`multiplexed: true`. Prefer isolated per-qubit runs after a multiplexed protected
-fit raises before saving a snapshot, because one invalid vectorized fit must not
-erase usable evidence for other qubits. Passing T1 evidence accumulates by qubit;
-retry only unresolved targets. Because this workflow includes 100-run statistics,
+`multiplexed: true`. The first 05 run must multiplex every active target with
+the same wait window and averages. If a later multiplexed protected fit aborts
+the snapshot, retry the remaining unresolved qubits together before isolating a
+single qubit. Passing T1 evidence accumulates by qubit; retry only unresolved
+targets that can share the wait range. Because this workflow includes 100-run
+statistics,
 final 05 evidence must cover at least 3.5 fitted lifetimes so that the trace has
 reached its equilibrium tail. Use the emitted
 `recommended_statistics_max_wait_time_in_ns` (4.5x the fitted lifetime, rounded
@@ -358,8 +448,9 @@ authorized deterministic setup if any `extras/readout_fidelity` mapping key is
 missing. The setup value is a non-passing zero sentinel used only so Qualibrate's
 state recorder can observe an old value; 07b must replace it with measured evidence.
 Normalize library fidelity values expressed as percentages (for example `88.6`)
-to fractions (`0.886`) before acceptance or state commit. Retry only unresolved
-qubits.
+to fractions (`0.886`) before acceptance or state commit. Retry unresolved
+qubits that can share the same readout-amplitude recovery together; do not
+walk failed 07b targets one isolated qubit at a time.
 
 ### Reset selection — thermal by default, active only after 07b evidence
 
@@ -384,7 +475,9 @@ Run Ramsey followed by T2 echo. Require a finite positive lifetime, relative
 uncertainty below 0.25, at least two samples per lifetime, and at least 3.5
 lifetimes of coverage before resolving a qubit. T2 echo additionally requires
 R-squared of at least 0.90 and a non-boundary fit. This longer coverage is
-mandatory because both values feed downstream 100-run statistics. Use the
+mandatory because both values feed downstream 100-run statistics. The first 06
+and 06b runs must multiplex every active target with the same wait window;
+retry unresolved qubits together when they can share that window. Use the
 emitted 4.5x recommended statistics wait time when forming compatible target
 subgroups. The Ramsey frequency correction and T2 state values remain separately
 committed.
@@ -392,8 +485,9 @@ committed.
 ### 10a — single-qubit randomized benchmarking
 
 Require a successful fit and finite EPC/EPG values in [0, 1] for every resolved
-qubit. The depth must be divisible by `delta_clifford`, and retries may use a
-target subgroup.
+qubit. The first 10a run must multiplex every active target with the same depth
+settings. The depth must be divisible by `delta_clifford`, and later retries may
+use a shared-parameter unresolved subgroup.
 
 ### 05st / 06st_t2star / 06st_t2e — 100-run statistics
 
@@ -403,6 +497,8 @@ fit must cover at least 3.5 lifetimes. For the statistic being measured, the
 requested `max_wait_time_in_ns` must lie between 3.5 and 5.5 times its accepted
 T1/T2 value. This ensures that the baseline has reached equilibrium and the
 statistics range is approximately four lifetimes; prefer 4.5 times the baseline.
+Start from the largest compatible multiplex group that can share one
+`max_wait_time_in_ns`; do not begin with isolated one-qubit statistics runs.
 
 Once those prerequisites pass, run each 05st/06st node once. JY does not refit all
 100 raw iterations, does not impose a 100/100 secondary fitting gate, and does not

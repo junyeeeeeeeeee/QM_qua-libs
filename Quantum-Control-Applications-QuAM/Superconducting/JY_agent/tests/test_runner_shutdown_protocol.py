@@ -6,7 +6,9 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+from jy_agent.runner import _verify_worker_exit_receipt
 from jy_agent.service import AgentService
+from jy_agent.worker import _write_signed_exit_receipt
 from jy_agent.util import sha256_file, utc_now
 from jy_agent.worker import _persist_recovery_checkpoint
 
@@ -14,6 +16,30 @@ from test_core import ENTRY_PHRASE, make_settings, sample_state
 
 
 class RunnerShutdownProtocolTests(unittest.TestCase):
+    def test_worker_exit_receipt_is_bound_to_process_token(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "exit.json"
+            payload = {
+                "run_id": "signed-run",
+                "termination_cause": "instrument_unreachable",
+                "cleanup_verified": True,
+                "lock_release_authorized": True,
+                "lock_released": True,
+            }
+            _write_signed_exit_receipt(path, payload, "worker-secret")
+            receipt = json.loads(path.read_text(encoding="utf-8"))
+
+            self.assertTrue(
+                _verify_worker_exit_receipt(receipt, "worker-secret")
+            )
+            self.assertFalse(
+                _verify_worker_exit_receipt(receipt, "different-secret")
+            )
+            receipt["lock_released"] = False
+            self.assertFalse(
+                _verify_worker_exit_receipt(receipt, "worker-secret")
+            )
+
     def test_worker_persists_recovery_checkpoint_before_hardware(self) -> None:
         with tempfile.TemporaryDirectory() as folder:
             service = AgentService(

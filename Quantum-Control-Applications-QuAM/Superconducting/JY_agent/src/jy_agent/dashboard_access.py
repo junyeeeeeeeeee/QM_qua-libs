@@ -16,7 +16,7 @@ class DashboardAccessError(RuntimeError):
 
 
 class DashboardAccessManager:
-    """Issue auditable one-time pairing codes and per-device browser sessions."""
+    """Issue auditable, revocable browser sessions for the Dashboard."""
 
     def __init__(
         self,
@@ -150,6 +150,23 @@ class DashboardAccessManager:
             )
             self.db.event(
                 "dashboard_initial_device_paired",
+                actor,
+                {"device_id": device["id"]},
+                connection=connection,
+            )
+            return device
+
+    def issue_password_session(self, *, actor: str) -> dict[str, Any]:
+        now = datetime.now(timezone.utc)
+        with self.db.transaction(immediate=True) as connection:
+            device = self._issue_device_with_connection(
+                connection,
+                label="Password-authenticated browser",
+                actor=actor,
+                now=now,
+            )
+            self.db.event(
+                "dashboard_password_login",
                 actor,
                 {"device_id": device["id"]},
                 connection=connection,

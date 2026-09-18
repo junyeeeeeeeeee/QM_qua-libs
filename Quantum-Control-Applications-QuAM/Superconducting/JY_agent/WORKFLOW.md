@@ -39,10 +39,13 @@ PID、port 與 Python 路徑記錄到 `runtime/server-bootstrap.json`。長駐 S
 `Enter JY measurement mode` 與 `Enter JY automatic measurement mode`。
 
 - `進入 JY 量測模式`：agent 先檢查服務健康度，再呼叫
-  `jy_enter_measurement_mode`。使用者取得一個共用 Dashboard URL；每次透過
+  `jy_enter_measurement_mode`（不必傳 targets／multiplexed；新 workflow 使用
+  `state.json` `active_qubit_names` 且預設 multiplexed=true）。使用者取得一個共用
+  Dashboard URL；每次透過
   `jy_request_conversational_run` 建立單一提案、網頁核准、執行、snapshot 分析、
   Decision/Reason/Next action，state commit 另行核准。
-- `進入 JY 自動量測模式`：agent 呼叫 `jy_enter_autonomy_mode`，使用者在 Dashboard
+- `進入 JY 自動量測模式`：agent 呼叫 `jy_enter_autonomy_mode`（同樣省略
+  targets／multiplexed，除非操作者明確覆寫），使用者在 Dashboard
   的核准分頁核准一次 bounded lease。之後只用 `jy_autonomy_*` tools；超出 targets、nodes、
   8 小時、20 次／node／qubit 或參數安全範圍必須重新授權。Codex 若提供 durable
   goal，會建立 session-scoped goal，並用 `jy_wait_for_autonomy_status` 等待事件；
@@ -71,9 +74,9 @@ PID、port 與 Python 路徑記錄到 `runtime/server-bootstrap.json`。長駐 S
 顯示恢復方式。可證明連線從未建立且 state 已恢復時釋放 lock；執行中失聯則保留
 local quarantine，但不阻擋完整關機關閉服務。
 
-`02x`、`02a` 是 fixed multiplex nodes。bounded lease 必須涵蓋 workflow 的全部
-targets；若 Decision 只指出 q2 需要重測，server 仍會把 02a 的 `qubits` 正規化成
-完整 q1–q10 batch。子群 lease 會在碰硬體前被拒絕，但不會因此誤把 lease halt。
+每個 calibration node 的第一次 run 必須用同一組參數 multiplex 全部 active
+targets；分析後排除已通過目標，只對未通過子群改參數重測。誤排已通過目標會被
+server 拒絕，但不會 hard-stop lease。
 
 預設流程在 `06` 後立刻執行 `06b`。所有有 reset 參數的實驗預設使用 thermal；
 只有 active-reset 07b 同時通過緊實雙雲團判斷且 fidelity `>= 0.85` 的 qubit，後續
@@ -160,9 +163,11 @@ the MCP connection before its `initialize` response.
 
 ### 2. Enter a mode
 
-- `進入 JY 量測模式` calls `jy_enter_measurement_mode`. One shared Dashboard
+- `進入 JY 量測模式` calls `jy_enter_measurement_mode` without requiring chat-side
+  targets or multiplexed; a new workflow uses `state.json` `active_qubit_names`
+  and defaults `multiplexed=true`. One shared Dashboard
   handles per-run and per-state-change approval.
-- `進入 JY 自動量測模式` calls `jy_enter_autonomy_mode`. One Dashboard approval
+- `進入 JY 自動量測模式` calls `jy_enter_autonomy_mode` the same way. One Dashboard approval
   activates a bounded lease; later actions must remain within targets, nodes,
   eight hours, 20 attempts per node/qubit, and hard parameter policy. Codex uses
   a session-scoped durable goal when available and waits with
@@ -183,7 +188,12 @@ Dashboard updates on an SSE event. Only a passing, identical decision patch can
 be committed automatically; snapshot, worker, hash, lock, and policy anomalies
 halt scheduling immediately.
 
-The default sequence runs 06b immediately after 06. Every reset-capable node
+The default sequence is `02x → 02c → 02a`, then the rest of bring-up. The
+first run of `02c`, `04`, `05`, `07b`, `06`, `06b`, and `10a` must multiplex
+every active target with the same parameters, like `02x`. Later retries may
+omit resolved qubits, but unresolved qubits that can share a parameter change
+must be retried together. The
+default sequence runs 06b immediately after 06. Every reset-capable node
 defaults to thermal reset. A qubit may explicitly switch downstream runs to active
 reset only after an active-reset 07b run shows two compact clouds and fidelity of
 at least 0.85. Active-reset statistics require accepted active-reset repeats of

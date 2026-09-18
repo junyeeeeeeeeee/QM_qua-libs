@@ -1,7 +1,7 @@
 # Calibration experience log
 
 This directory preserves reproducible experience for every bring-up node:
-`02x`, `02a`, `02c`, `03a`, `04`, `05`, `07b`, `06`, `06b`, `10a`,
+`02x`, `02c`, `02a`, `03a`, `04`, `05`, `07b`, `06`, `06b`, `10a`,
 `05st`, `06st_t2star`, and `06st_t2e`.
 
 Before proposing a run, read the relevant `<node>.md` file when it exists.
@@ -10,6 +10,12 @@ the current qubit must independently pass every policy and node acceptance
 check. Prefer experience from the same device/project and similar wiring or
 qubit type. Never copy a learned frequency, amplitude, power, or lifetime into
 active state without the normal run analysis and separately approved commit.
+
+Scheduling: start every node with one multiplexed run of all active targets and
+the same parameters. After analysis, omit already-resolved qubits and retry
+unresolved targets together with modified settings. Split into subgroups only
+when they cannot share the sweep. Do not begin a node with sequential isolated
+one-qubit runs.
 
 Append an `Accepted setting` only after a saved snapshot passes the complete
 node-specific checks. Include:

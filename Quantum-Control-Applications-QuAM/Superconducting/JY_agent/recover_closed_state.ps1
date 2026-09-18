@@ -1,8 +1,6 @@
-param(
+﻿param(
     [Parameter(Mandatory = $false)]
     [string]$Python = $env:JY_QUALIBRATE_PYTHON,
-    [Parameter(Mandatory = $false)]
-    [string]$QualibrateConfig = $env:QUALIBRATE_CONFIG_FILE,
     [int]$TimeoutSeconds = 60
 )
 
@@ -48,7 +46,7 @@ $Preparation = $null
 $PreparationError = ""
 try {
     $Environment = Resolve-JyEnvironment `
-        $AgentRoot $Python $QualibrateConfig $Saved -RequireAgent
+        $AgentRoot $Python $Saved -RequireAgent
     $ResolvedPython = [string]$Environment.python
     $PreparationText = (& $ResolvedPython -m jy_agent recover-close `
         --timeout-seconds ([Math]::Max(0, [Math]::Min($TimeoutSeconds, 300))) | Out-String).Trim()

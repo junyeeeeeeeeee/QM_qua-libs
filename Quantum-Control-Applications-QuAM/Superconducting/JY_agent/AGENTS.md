@@ -29,7 +29,9 @@ session dashboard URL for human review. `進入 JY 量測模式` calls
 exactly one policy-registered experiment at a time, use `jy_list_experiments` and
 `jy_request_conversational_run`, preserve and show the entry response
 `browser_url`, wait for each approval on its Approval page, then execute/analyze it;
-any state commit also appears there. `進入 JY 自動量測模式` calls
+any state commit also appears there. Omit `targets` and `multiplexed` unless the
+operator explicitly overrides them; a new workflow uses `state.json`
+`active_qubit_names` and defaults `multiplexed=true`. `進入 JY 自動量測模式` calls
 `jy_enter_autonomy_mode`, shows its session `browser_url`, waits for the one
 bounded-lease activation with `jy_wait_for_autonomy_status`, and then uses only
 `jy_autonomy_*` execution tools. On hosts with durable goals, automatic-mode
@@ -82,7 +84,14 @@ interactive terminal command is fallback only. Never substitute or fabricate a
 URL. Show the user only the entry result's top-level `browser_url`; nested page
 URLs are internal navigation on the same Dashboard service, not additional
 websites. Legacy `/approve/...`, `/autonomy/...`, and `/session/...` links redirect
-to the appropriate current view. Never use
+to the appropriate current view. Successful entry replies with that bare URL.
+After the operator sends `已核准` / `Approved`, the next chat reply starts with
+exactly `已核准`. While measurement mode is still open, any paused turn must
+copy `operator_handoff.chat` as a three-item markdown list, never as one
+paragraph, so the operator always sees what to do, which exact phrase to send
+afterwards, and the shutdown hint. A live turn may execute
+`結束量測` directly; a paused or disconnected turn needs Dashboard Home
+shutdown first, then `結束量測` to verify. See `Command.md`. Never use
 the lease outside its targets/nodes or after pause, expiry, revocation, or halt.
 Low confidence, `needs_review`, and `manual_review` do not themselves pause the
 lease, but only a completed `pass` run with an identical recorded decision patch

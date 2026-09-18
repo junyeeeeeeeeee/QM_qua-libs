@@ -26,6 +26,8 @@ def analysis_for(node_id: str, names: list[str]) -> dict:
             name: {"fit_successful": True, "drive_freq": 5.0e9}
             for name in names
         }
+    elif node_id in {"02x", "02a"}:
+        results = {name: {"RO_frequency": 6.0e9} for name in names}
     elif node_id == "05":
         results = {
             name: {
@@ -56,6 +58,37 @@ def analysis_for(node_id: str, names: list[str]) -> dict:
 
 
 class TestWorkflowSubgroups(unittest.TestCase):
+    def test_mixed_02x_run_resolves_only_usable_qubits(self) -> None:
+        analysis = analysis_for("02x", ["q1", "q2"])
+        analysis["dataset_metrics"]["qubits"]["q2"]["robust_snr"] = 1.0
+        analysis["dataset_metrics"]["qubits"]["q2"]["edge_fraction"] = 0.01
+        resolved = resolve_node_targets(
+            "02x",
+            [
+                {
+                    "status": "completed",
+                    "analysis_status": "needs_review",
+                    "analysis_json": json.dumps(analysis),
+                }
+            ],
+        )
+        self.assertEqual(resolved, {"q1"})
+
+    def test_02x_metrics_resolve_when_fit_results_are_null(self) -> None:
+        analysis = analysis_for("02x", ["q1", "q2"])
+        analysis["fit_quality"]["results"] = None
+        resolved = resolve_node_targets(
+            "02x",
+            [
+                {
+                    "status": "completed",
+                    "analysis_status": "pass",
+                    "analysis_json": json.dumps(analysis),
+                }
+            ],
+        )
+        self.assertEqual(resolved, {"q1", "q2"})
+
     def test_mixed_03a_run_resolves_only_usable_qubits(self) -> None:
         analysis = analysis_for("03a", ["q1", "q2"])
         analysis["fit_quality"]["results"]["q2"]["fit_successful"] = False
@@ -97,6 +130,18 @@ class TestWorkflowSubgroups(unittest.TestCase):
         self.assertEqual(resolve_03a_candidate_targets(rows), {"q1"})
         self.assertEqual(resolve_node_targets("03a", rows), set())
 
+    def test_03a_moderately_wide_fine_peak_can_be_final(self) -> None:
+        analysis = analysis_for("03a", ["q1"])
+        analysis["dataset_metrics"]["qubits"]["q1"][
+            "feature_fwhm_hz"
+        ] = 14_000_000.0
+        rows = [{
+            "status": "completed",
+            "analysis_status": "pass",
+            "analysis_json": json.dumps(analysis),
+        }]
+        self.assertEqual(resolve_node_targets("03a", rows), {"q1"})
+
     def test_03a_fine_peak_below_half_mhz_is_not_final(self) -> None:
         analysis = analysis_for("03a", ["q1"])
         analysis["dataset_metrics"]["qubits"]["q1"][
@@ -122,11 +167,11 @@ class TestWorkflowSubgroups(unittest.TestCase):
         }]
         self.assertEqual(resolve_node_targets("03a", rows), {"q1"})
 
-    def test_03a_candidate_requires_snr_of_ten(self) -> None:
+    def test_03a_candidate_requires_snr_of_six(self) -> None:
         analysis = analysis_for("03a", ["q1", "q5"])
         analysis["03a_stage"] = "coarse_candidate"
-        analysis["dataset_metrics"]["qubits"]["q1"]["robust_snr"] = 7.6
-        analysis["dataset_metrics"]["qubits"]["q5"]["robust_snr"] = 10.1
+        analysis["dataset_metrics"]["qubits"]["q1"]["robust_snr"] = 5.4
+        analysis["dataset_metrics"]["qubits"]["q5"]["robust_snr"] = 6.2
         rows = [
             {
                 "status": "completed",
@@ -139,7 +184,7 @@ class TestWorkflowSubgroups(unittest.TestCase):
     def test_03a_noisy_interior_trace_must_reach_2000_before_shift(self) -> None:
         analysis = analysis_for("03a", ["q1", "q2"])
         analysis["03a_stage"] = "coarse_candidate"
-        analysis["dataset_metrics"]["qubits"]["q1"]["robust_snr"] = 7.5
+        analysis["dataset_metrics"]["qubits"]["q1"]["robust_snr"] = 5.4
         analysis["dataset_metrics"]["qubits"]["q2"].update(
             {"edge_fraction": 0.01, "robust_snr": 5.4}
         )
@@ -342,6 +387,41 @@ class TestWorkflowSubgroups(unittest.TestCase):
                 "UPDATE workflows SET current_node = '04' WHERE id = ?",
                 (workflow["id"],),
             )
+            with self.assertRaisesRegex(
+                Exception, "first 04 run must multiplex every active target"
+            ):
+                service.request_run(
+                    workflow["id"],
+                    "04",
+                    {"qubits": targets[1:]},
+                    "First 04 cannot start as a subgroup.",
+                    "unittest",
+                )
+            first = service.request_run(
+                workflow["id"],
+                "04",
+                {"qubits": targets},
+                "First 04 multiplexes every active target.",
+                "unittest",
+            )
+            analysis = analysis_for("04", targets)
+            analysis["fit_quality"]["results"][targets[1]]["Pi_amplitude"] = 0.0
+            analysis["fit_quality"]["results"][targets[2]]["Pi_amplitude"] = 0.0
+            service.db.execute(
+                """
+                INSERT INTO runs(
+                    id, workflow_id, proposal_id, node_id, parameters_json,
+                    status, analysis_status, analysis_json
+                ) VALUES (?, ?, ?, '04', ?, 'completed', 'needs_review', ?)
+                """,
+                (
+                    "offline-04-first",
+                    workflow["id"],
+                    first["id"],
+                    json.dumps({"qubits": targets}),
+                    json.dumps(analysis),
+                ),
+            )
             proposal = service.request_run(
                 workflow["id"],
                 "04",
@@ -371,17 +451,58 @@ class TestWorkflowSubgroups(unittest.TestCase):
                 "UPDATE workflows SET current_node = '05' WHERE id = ?",
                 (workflow["id"],),
             )
+            with self.assertRaisesRegex(
+                Exception, "first 05 run must multiplex every active target"
+            ):
+                service.request_run(
+                    workflow["id"],
+                    "05",
+                    {"qubits": [targets[0]]},
+                    "First 05 cannot start as an isolated qubit.",
+                    "unittest",
+                )
+            first = service.request_run(
+                workflow["id"],
+                "05",
+                {"qubits": targets},
+                "First 05 multiplexes every active target.",
+                "unittest",
+            )
+            analysis = analysis_for("05", targets)
+            analysis["fit_quality"]["results"][targets[1]]["r_squared"] = 0.5
+            analysis["fit_quality"]["results"][targets[2]]["r_squared"] = 0.5
+            service.db.execute(
+                """
+                INSERT INTO runs(
+                    id, workflow_id, proposal_id, node_id, parameters_json,
+                    status, analysis_status, analysis_json
+                ) VALUES (?, ?, ?, '05', ?, 'completed', 'needs_review', ?)
+                """,
+                (
+                    "offline-05-first",
+                    workflow["id"],
+                    first["id"],
+                    json.dumps({"qubits": targets}),
+                    json.dumps(analysis),
+                ),
+            )
             proposal = service.request_run(
                 workflow["id"],
                 "05",
-                {"qubits": [targets[0]]},
+                {"qubits": [targets[1]]},
                 "Isolate one T1 trace so another qubit cannot abort its fit.",
                 "unittest",
             )
             self.assertEqual(
-                proposal["payload"]["parameters"]["qubits"], [targets[0]]
+                proposal["payload"]["parameters"]["qubits"], [targets[1]]
             )
             self.assertTrue(proposal["payload"]["parameters"]["multiplexed"])
+            self.assertTrue(
+                any(
+                    "retry them together with the same parameters" in warning
+                    for warning in proposal["payload"]["warnings"]
+                )
+            )
 
     def test_05_resolution_is_per_qubit(self) -> None:
         analysis = analysis_for("05", ["q1", "q2"])

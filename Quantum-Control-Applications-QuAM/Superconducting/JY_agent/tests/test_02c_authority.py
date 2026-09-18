@@ -119,6 +119,39 @@ class Test02cAuthority(unittest.TestCase):
                 "UPDATE workflows SET current_node = '02c' WHERE id = ?",
                 (workflow["id"],),
             )
+            with self.assertRaisesRegex(
+                Exception, "first 02c run must multiplex every active target"
+            ):
+                service.request_run(
+                    workflow["id"],
+                    "02c",
+                    {"qubits": ["q3", "q4", "q5"]},
+                    "First 02c cannot start as a subgroup.",
+                    "unittest",
+                )
+            first = service.request_run(
+                workflow["id"],
+                "02c",
+                {"qubits": targets},
+                "First 02c multiplexes every active target.",
+                "unittest",
+            )
+            service.db.execute(
+                """
+                INSERT INTO runs(
+                    id, workflow_id, proposal_id, node_id, parameters_json,
+                    status, analysis_status, analysis_json
+                ) VALUES (
+                    'offline-02c-first', ?, ?, '02c', ?, 'completed',
+                    'needs_review', '{}'
+                )
+                """,
+                (
+                    workflow["id"],
+                    first["id"],
+                    json.dumps({"qubits": targets}),
+                ),
+            )
             subgroup = ["q3", "q4", "q5"]
             proposal = service.request_run(
                 workflow["id"],

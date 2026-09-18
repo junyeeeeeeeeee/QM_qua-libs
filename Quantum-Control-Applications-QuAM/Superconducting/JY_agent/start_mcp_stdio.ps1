@@ -1,8 +1,6 @@
 param(
     [Parameter(Mandatory = $false)]
-    [string]$Python = $env:JY_QUALIBRATE_PYTHON,
-    [Parameter(Mandatory = $false)]
-    [string]$QualibrateConfig = $env:QUALIBRATE_CONFIG_FILE
+    [string]$Python = $env:JY_QUALIBRATE_PYTHON
 )
 
 $ErrorActionPreference = "Stop"
@@ -26,15 +24,14 @@ if (Test-Path -LiteralPath $BootstrapPath -PathType Leaf) {
 # Keeping this launcher protocol-only prevents a tunnel failure from closing the
 # MCP connection before the initialize response.
 $Environment = Resolve-JyEnvironment `
-    $AgentRoot $Python $QualibrateConfig $Bootstrap -RequireAgent
+    $AgentRoot $Python $Bootstrap -RequireAgent
 $ResolvedPython = [string]$Environment.python
 $LaunchLog = Join-Path $AgentRoot "runtime\mcp-stdio-launch.log"
 New-Item -ItemType Directory -Path (Split-Path -Parent $LaunchLog) -Force |
     Out-Null
 Add-Content -LiteralPath $LaunchLog -Encoding UTF8 -Value (
-    "{0} pid={1} python={2} config={3} cwd={4}" -f
-    [DateTimeOffset]::Now.ToString("o"), $PID, $ResolvedPython,
-    [string]$Environment.qualibrate_config, (Get-Location).Path
+    "{0} pid={1} python={2} cwd={3}" -f
+    [DateTimeOffset]::Now.ToString("o"), $PID, $ResolvedPython, (Get-Location).Path
 )
 
 & $ResolvedPython -m jy_agent stdio

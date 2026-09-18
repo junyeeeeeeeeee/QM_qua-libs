@@ -14,7 +14,12 @@ from jy_agent.service import (
     AgentService,
     AutonomyEvidenceError,
     AutonomyQuotaError,
+    AutonomyScopeError,
+    SHUTDOWN_HINT,
     ServiceError,
+    host_pause_operator_handoff,
+    recover_operator_handoff,
+    recovery_console_operator_handoff,
 )
 from jy_agent.state import StateError
 from jy_agent.util import atomic_write_json, json_dumps, sha256_file
@@ -44,7 +49,106 @@ def activate_lease(service: AgentService, workflow_id: str) -> tuple[dict, dict]
 
 
 class AutonomyTests(unittest.TestCase):
-    def test_02a_retry_expands_to_full_authorized_multiplex_targets(self) -> None:
+    def test_02a_retry_keeps_unresolved_subgroup_without_halt(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            state, wiring, targets = sample_multiplex_state_and_wiring()
+            settings = make_settings(Path(folder), state)
+            atomic_write_json(settings.wiring_path, wiring)
+            service = AgentService(settings)
+            workflow = service.start_workflow(
+                targets,
+                {"multiplexed": True},
+                "unittest-agent",
+                "進入 JY 量測模式",
+            )
+            service.db.execute(
+                "UPDATE workflows SET current_node = '02a' WHERE id = ?",
+                (workflow["id"],),
+            )
+            _, lease = activate_lease(service, workflow["id"])
+            first_proposal = service.request_run(
+                workflow["id"],
+                "02a",
+                {
+                    "qubits": targets,
+                    "frequency_span_in_mhz": 20,
+                    "multiplexed": True,
+                },
+                "Initial shared-parameter 02a batch.",
+                "unittest-agent",
+                autonomy_lease_id=lease["id"],
+            )
+            analysis = {
+                "fit_quality": {
+                    "results": {
+                        targets[0]: {"RO_frequency": 6.0e9},
+                        targets[1]: {"RO_frequency": 6.1e9},
+                    }
+                },
+                "dataset_metrics": {
+                    "qubits": {
+                        targets[0]: {"edge_fraction": 0.4, "robust_snr": 20.0},
+                        targets[1]: {"edge_fraction": 0.01, "robust_snr": 1.0},
+                        **{
+                            name: {"edge_fraction": 0.4, "robust_snr": 20.0}
+                            for name in targets[2:]
+                        },
+                    }
+                },
+            }
+            # Mark remaining targets resolved via metrics as well.
+            for name in targets[2:]:
+                analysis["fit_quality"]["results"][name] = {"RO_frequency": 6.2e9}
+            service.db.execute(
+                "INSERT INTO runs(id, workflow_id, proposal_id, node_id, "
+                "parameters_json, status, analysis_status, analysis_json) "
+                "VALUES (?, ?, ?, '02a', ?, 'completed', 'needs_review', ?)",
+                (
+                    "02a-first-batch",
+                    workflow["id"],
+                    first_proposal["id"],
+                    json_dumps({"qubits": targets, "multiplexed": True}),
+                    json_dumps(analysis),
+                ),
+            )
+
+            with self.assertRaisesRegex(AutonomyScopeError, "unresolved"):
+                service.request_run(
+                    workflow["id"],
+                    "02a",
+                    {
+                        "qubits": targets,
+                        "frequency_span_in_mhz": 40,
+                        "multiplexed": True,
+                    },
+                    "Must not remeasure the already-resolved target.",
+                    "unittest-agent",
+                    autonomy_lease_id=lease["id"],
+                )
+            self.assertEqual(
+                service.autonomy_status(lease_id=lease["id"])["status"], "active"
+            )
+
+            proposal = service.request_run(
+                workflow["id"],
+                "02a",
+                {
+                    "qubits": [targets[1]],
+                    "frequency_span_in_mhz": 40,
+                    "multiplexed": True,
+                },
+                "Retry only the unresolved edge-limited target.",
+                "unittest-agent",
+                autonomy_lease_id=lease["id"],
+            )
+            self.assertEqual(
+                proposal["payload"]["parameters"]["qubits"], [targets[1]]
+            )
+            self.assertEqual(
+                service.autonomy_status(lease_id=lease["id"])["status"], "active"
+            )
+
+    def test_02a_first_run_still_requires_every_active_target(self) -> None:
         with tempfile.TemporaryDirectory() as folder:
             state, wiring, targets = sample_multiplex_state_and_wiring()
             settings = make_settings(Path(folder), state)
@@ -62,62 +166,24 @@ class AutonomyTests(unittest.TestCase):
             )
             _, lease = activate_lease(service, workflow["id"])
 
-            proposal = service.request_run(
-                workflow["id"],
-                "02a",
-                {
-                    "qubits": [targets[0]],
-                    "frequency_span_in_mhz": 80,
-                    "multiplexed": True,
-                },
-                "Retry the edge-limited feature without shrinking the fixed batch.",
-                "unittest-agent",
-                autonomy_lease_id=lease["id"],
-            )
-
-            self.assertEqual(proposal["payload"]["parameters"]["qubits"], targets)
+            with self.assertRaisesRegex(AutonomyScopeError, "first 02a run"):
+                service.request_run(
+                    workflow["id"],
+                    "02a",
+                    {
+                        "qubits": [targets[0]],
+                        "frequency_span_in_mhz": 20,
+                        "multiplexed": True,
+                    },
+                    "Isolated first batch is not allowed.",
+                    "unittest-agent",
+                    autonomy_lease_id=lease["id"],
+                )
             self.assertEqual(
                 service.autonomy_status(lease_id=lease["id"])["status"], "active"
             )
-            event = service.db.one(
-                "SELECT payload_json FROM events WHERE event_type = "
-                "'fixed_target_run_expanded' ORDER BY id DESC LIMIT 1"
-            )
-            self.assertEqual(json.loads(event["payload_json"])["requested_targets"], [targets[0]])
 
-    def test_02a_narrow_lease_is_rejected_before_hardware_or_halt(self) -> None:
-        with tempfile.TemporaryDirectory() as folder:
-            state, wiring, targets = sample_multiplex_state_and_wiring()
-            settings = make_settings(Path(folder), state)
-            atomic_write_json(settings.wiring_path, wiring)
-            service = AgentService(settings)
-            workflow = service.start_workflow(
-                targets,
-                {"multiplexed": True},
-                "unittest-agent",
-                "進入 JY 量測模式",
-            )
-            service.db.execute(
-                "UPDATE workflows SET current_node = '02a' WHERE id = ?",
-                (workflow["id"],),
-            )
-
-            with self.assertRaisesRegex(ServiceError, "every workflow target"):
-                service.request_autonomy_lease(
-                    workflow["id"],
-                    "unittest-agent",
-                    AUTO_PHRASE,
-                    "A target-local lease is not sufficient for fixed 02a.",
-                    targets=[targets[0]],
-                )
-            self.assertIsNone(
-                service.db.one(
-                    "SELECT id FROM autonomy_leases WHERE workflow_id = ?",
-                    (workflow["id"],),
-                )
-            )
-
-    def test_02a_repeat_decision_records_full_batch_retry_parameters(self) -> None:
+    def test_02a_repeat_decision_keeps_unresolved_retry_parameters(self) -> None:
         with tempfile.TemporaryDirectory() as folder:
             state, wiring, targets = sample_multiplex_state_and_wiring()
             settings = make_settings(Path(folder), state)
@@ -137,7 +203,7 @@ class AutonomyTests(unittest.TestCase):
                 workflow["id"],
                 "02a",
                 {"qubits": targets, "multiplexed": True},
-                "Collect the initial fixed-batch evidence.",
+                "Collect the initial shared-parameter evidence.",
                 "unittest-agent",
             )
             run_id = "02a-edge-run"
@@ -157,17 +223,115 @@ class AutonomyTests(unittest.TestCase):
                 workflow["id"],
                 run_id,
                 "repeat",
-                "One feature is edge-limited; widen the same fixed batch.",
+                "One feature is edge-limited; retry only that unresolved target.",
                 "02a",
-                {"qubits": [targets[0]], "frequency_span_in_mhz": 80},
+                {"qubits": [targets[0]], "frequency_span_in_mhz": 40},
                 [],
                 "unittest-agent",
             )
 
             self.assertEqual(
-                decision["next_action"]["new_parameters"]["qubits"], targets
+                decision["next_action"]["new_parameters"]["qubits"], [targets[0]]
             )
-            self.assertTrue(decision["parameter_adjustments"])
+            self.assertFalse(decision.get("parameter_adjustments"))
+
+    def test_03a_coarse_retry_with_candidates_soft_rejects_without_halt(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            state, wiring, targets = sample_multiplex_state_and_wiring()
+            settings = make_settings(Path(folder), state)
+            atomic_write_json(settings.wiring_path, wiring)
+            service = AgentService(settings)
+            workflow = service.start_workflow(
+                targets,
+                {"multiplexed": True},
+                "unittest-agent",
+                "進入 JY 量測模式",
+            )
+            service.db.execute(
+                "UPDATE workflows SET current_node = '03a' WHERE id = ?",
+                (workflow["id"],),
+            )
+            _, lease = activate_lease(service, workflow["id"])
+            for name in targets:
+                state["qubits"][name]["xy"]["intermediate_frequency"] = 0.0
+            atomic_write_json(settings.active_state, state)
+            first_proposal = service.request_run(
+                workflow["id"],
+                "03a",
+                {
+                    "qubits": targets,
+                    "frequency_span_in_mhz": 800,
+                    "frequency_step_in_mhz": 1,
+                    "multiplexed": True,
+                    "num_averages": 100,
+                    "operation": "saturation",
+                    "operation_amplitude_factor": 0.1,
+                    "operation_len_in_ns": 50000,
+                },
+                "Initial 03a coarse batch.",
+                "unittest-agent",
+                autonomy_lease_id=lease["id"],
+            )
+            analysis = {
+                "03a_stage": "coarse_candidate",
+                "fit_quality": {
+                    "results": {
+                        name: {"fit_successful": True, "drive_freq": 5.0e9}
+                        for name in targets
+                    }
+                },
+                "dataset_metrics": {
+                    "qubits": {
+                        targets[0]: {
+                            "edge_fraction": 0.4,
+                            "robust_snr": 20.0,
+                            "feature_fwhm_hz": 7_500_000.0,
+                        },
+                        **{
+                            name: {
+                                "edge_fraction": 0.4,
+                                "robust_snr": 2.0,
+                                "feature_fwhm_hz": 7_500_000.0,
+                            }
+                            for name in targets[1:]
+                        },
+                    }
+                },
+            }
+            service.db.execute(
+                "INSERT INTO runs(id, workflow_id, proposal_id, node_id, "
+                "parameters_json, status, analysis_status, analysis_json) "
+                "VALUES (?, ?, ?, '03a', ?, 'completed', 'needs_review', ?)",
+                (
+                    "03a-coarse",
+                    workflow["id"],
+                    first_proposal["id"],
+                    json_dumps({"qubits": targets, "multiplexed": True}),
+                    json_dumps(analysis),
+                ),
+            )
+
+            with self.assertRaisesRegex(AutonomyScopeError, "allowed subgroup"):
+                service.start_authorized_run(
+                    workflow["id"],
+                    lease["id"],
+                    "03a",
+                    {
+                        "qubits": targets,
+                        "frequency_span_in_mhz": 800,
+                        "frequency_step_in_mhz": 1,
+                        "multiplexed": True,
+                        "num_averages": 500,
+                        "operation": "saturation",
+                        "operation_amplitude_factor": 0.1,
+                        "operation_len_in_ns": 50000,
+                    },
+                    "Must not remeasure SNR-cleared candidates in coarse retry.",
+                    "unittest-agent",
+                )
+            self.assertEqual(
+                service.autonomy_status(lease_id=lease["id"])["status"], "active"
+            )
 
     def test_measurement_entry_creates_conversational_workflow_without_lease(self) -> None:
         with tempfile.TemporaryDirectory() as folder:
@@ -184,6 +348,20 @@ class AutonomyTests(unittest.TestCase):
             self.assertEqual(entered["approval_model"], "per_run_and_state_commit")
             self.assertEqual(
                 entered["next_action"], "discuss_and_propose_one_experiment"
+            )
+            self.assertEqual(entered["browser_url"], "http://127.0.0.1:8766/")
+            self.assertEqual(entered["operator_handoff"]["reply"], "已核准")
+            self.assertIn("需要使用者做什麼:", entered["operator_handoff"]["chat"])
+            self.assertIn("完成後回傳: 已核准", entered["operator_handoff"]["chat"])
+            self.assertEqual(entered["operator_handoff"]["shutdown_hint"], SHUTDOWN_HINT)
+            self.assertIn(SHUTDOWN_HINT, entered["operator_handoff"]["chat"])
+            self.assertEqual(
+                entered["operator_handoff"]["chat"].splitlines(),
+                [
+                    "- 需要使用者做什麼: 開啟對話中的 Dashboard 網址並登入，到 Approval 頁核准。",
+                    "- 完成後回傳: 已核准",
+                    f"- {SHUTDOWN_HINT}",
+                ],
             )
 
     def test_autonomy_entry_creates_workflow_and_bounded_lease(self) -> None:
@@ -203,6 +381,40 @@ class AutonomyTests(unittest.TestCase):
             self.assertEqual(entered["next_action"], "human_approval")
             self.assertEqual(entered["browser_url"], "http://127.0.0.1:8766/")
             self.assertEqual(entered["dashboard"]["mode"], "autonomous")
+            self.assertEqual(entered["operator_handoff"]["reply"], "已核准")
+            self.assertIn("Approval 頁核准", entered["operator_handoff"]["do"])
+
+    def test_pending_autonomy_wait_timeout_returns_approval_handoff(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            service = AgentService(
+                make_settings(Path(folder), sample_state(0.2, 0.1))
+            )
+            entered = service.enter_autonomy_mode(
+                "unittest-agent", AUTO_PHRASE, ["q1"]
+            )
+            waited = service.wait_for_autonomy_status(
+                entered["authorization"]["id"], timeout_seconds=0
+            )
+            self.assertTrue(waited["timed_out"])
+            self.assertEqual(waited["authorization"]["status"], "pending")
+            self.assertEqual(waited["operator_handoff"]["reply"], "已核准")
+            self.assertIn(
+                "完成後回傳: 已核准", waited["operator_handoff"]["chat"]
+            )
+
+    def test_operator_handoff_recover_phrases_are_fixed(self) -> None:
+        self.assertEqual(recover_operator_handoff()["reply"], "恢復")
+        self.assertEqual(recovery_console_operator_handoff()["reply"], "恢復")
+        self.assertEqual(host_pause_operator_handoff()["reply"], "已核准")
+        self.assertIn("需要使用者做什麼:", recover_operator_handoff()["chat"])
+        self.assertEqual(recover_operator_handoff()["shutdown_hint"], SHUTDOWN_HINT)
+        self.assertIn(SHUTDOWN_HINT, recover_operator_handoff()["chat"])
+        chat_lines = recover_operator_handoff()["chat"].splitlines()
+        self.assertEqual(len(chat_lines), 3)
+        self.assertTrue(all(line.startswith("- ") for line in chat_lines))
+        self.assertEqual(chat_lines[0], "- 需要使用者做什麼: 讓系統安全收尾殘留的 workflow、process 與 JY 服務。")
+        self.assertEqual(chat_lines[1], "- 完成後回傳: 恢復")
+        self.assertEqual(chat_lines[2], f"- {SHUTDOWN_HINT}")
 
     def test_expired_conversational_proposal_does_not_block_autonomy_entry(self) -> None:
         with tempfile.TemporaryDirectory() as folder:
@@ -252,15 +464,70 @@ class AutonomyTests(unittest.TestCase):
                 resumed["next_action"], "continue_authorized_workflow"
             )
 
-    def test_phrase_only_entry_requires_targets_for_brand_new_workflow(self) -> None:
+    def test_phrase_only_entry_uses_active_qubit_names_and_defaults_multiplexed(self) -> None:
         with tempfile.TemporaryDirectory() as folder:
             service = AgentService(
                 make_settings(Path(folder), sample_state(0.2, 0.1))
             )
-            with self.assertRaisesRegex(ServiceError, "explicit targets"):
+            entered = service.enter_measurement_mode(
+                "unittest-agent", "進入 JY 量測模式"
+            )
+            workflow = entered["workflow"]
+            self.assertEqual(workflow["targets"], ["q1"])
+            self.assertTrue(workflow["initial_parameters"]["multiplexed"])
+
+    def test_phrase_only_entry_requires_active_qubit_names_for_brand_new_workflow(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            state = sample_state(0.2, 0.1)
+            del state["active_qubit_names"]
+            service = AgentService(make_settings(Path(folder), state))
+            with self.assertRaisesRegex(ServiceError, "active_qubit_names"):
                 service.enter_measurement_mode(
                     "unittest-agent", "進入 JY 量測模式"
                 )
+
+    def test_explicit_targets_override_active_qubit_names(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            state, wiring, targets = sample_multiplex_state_and_wiring()
+            settings = make_settings(Path(folder), state)
+            atomic_write_json(settings.wiring_path, wiring)
+            service = AgentService(settings)
+            entered = service.enter_measurement_mode(
+                "unittest-agent",
+                "進入 JY 量測模式",
+                [targets[0]],
+                multiplexed=False,
+            )
+            self.assertEqual(entered["workflow"]["targets"], [targets[0]])
+            self.assertFalse(entered["workflow"]["initial_parameters"]["multiplexed"])
+
+    def test_phrase_only_entry_uses_multiplex_active_qubit_names(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            state, wiring, targets = sample_multiplex_state_and_wiring()
+            settings = make_settings(Path(folder), state)
+            atomic_write_json(settings.wiring_path, wiring)
+            service = AgentService(settings)
+            entered = service.enter_measurement_mode(
+                "unittest-agent", "進入 JY 量測模式"
+            )
+            self.assertEqual(entered["workflow"]["targets"], targets)
+            self.assertTrue(entered["workflow"]["initial_parameters"]["multiplexed"])
+
+    def test_phrase_only_entry_resumes_non_multiplexed_workflow(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            service = AgentService(
+                make_settings(Path(folder), sample_state(0.2, 0.1))
+            )
+            workflow = start_test_workflow(service)
+            resumed = service.enter_measurement_mode(
+                "unittest-agent", "進入 JY 量測模式"
+            )
+            self.assertEqual(resumed["workflow"]["id"], workflow["id"])
+            self.assertFalse(
+                resumed["workflow"]["initial_parameters"].get("multiplexed", False)
+            )
 
     def test_autonomy_phrase_is_not_accepted_by_conversational_entry(self) -> None:
         with tempfile.TemporaryDirectory() as folder:
@@ -739,6 +1006,102 @@ class AutonomyTests(unittest.TestCase):
                 "paused",
             )
 
+    def test_resume_after_instrument_outage_is_not_re_paused(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            service = AgentService(
+                make_settings(Path(folder), sample_state(0.2, 0.1))
+            )
+            workflow = start_test_workflow(service)
+            proposal, lease = activate_lease(service, workflow["id"])
+            service._start_dashboard_session(
+                workflow["id"],
+                "autonomous",
+                "unittest-agent",
+                autonomy_lease_id=lease["id"],
+            )
+            service.db.execute(
+                "INSERT INTO runs(id, workflow_id, proposal_id, node_id, "
+                "parameters_json, status, analysis_status, analysis_json, "
+                "termination_cause, autonomy_lease_id) VALUES "
+                "('instrument-offline-run', ?, ?, '02x', ?, 'failed', 'failed', ?, "
+                "'instrument_unreachable', ?)",
+                (
+                    workflow["id"],
+                    proposal["id"],
+                    json_dumps({"qubits": ["q1"]}),
+                    json_dumps(
+                        {
+                            "analysis_status": "failed",
+                            "failure_category": "instrument_unreachable",
+                            "plots": [],
+                        }
+                    ),
+                    lease["id"],
+                ),
+            )
+            service.autonomy_watchdog_sweep()
+            session_id = service.dashboard_session_id_for_workflow(workflow["id"])
+
+            resumed = service.resume_measurement_mode(
+                workflow["id"], "on-site-operator", "恢復量測"
+            )
+            self.assertEqual(resumed["authorization"]["status"], "active")
+
+            service.autonomy_watchdog_sweep()
+            service.dashboard_review(session_id)
+
+            status = service.autonomy_status(lease_id=lease["id"])
+            self.assertEqual(status["status"], "active")
+            self.assertEqual(
+                service.dashboard_status(session_id)["status"], "active"
+            )
+
+    def test_start_run_while_instrument_paused_does_not_halt(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            service = AgentService(
+                make_settings(Path(folder), sample_state(0.2, 0.1))
+            )
+            workflow = start_test_workflow(service)
+            proposal, lease = activate_lease(service, workflow["id"])
+            service.db.execute(
+                "INSERT INTO runs(id, workflow_id, proposal_id, node_id, "
+                "parameters_json, status, analysis_status, analysis_json, "
+                "termination_cause, autonomy_lease_id) VALUES "
+                "('instrument-offline-run', ?, ?, '02x', ?, 'failed', 'failed', ?, "
+                "'instrument_unreachable', ?)",
+                (
+                    workflow["id"],
+                    proposal["id"],
+                    json_dumps({"qubits": ["q1"]}),
+                    json_dumps(
+                        {
+                            "analysis_status": "failed",
+                            "failure_category": "instrument_unreachable",
+                            "plots": [],
+                        }
+                    ),
+                    lease["id"],
+                ),
+            )
+            service.autonomy_watchdog_sweep()
+            self.assertEqual(
+                service.autonomy_status(lease_id=lease["id"])["status"], "paused"
+            )
+
+            with self.assertRaisesRegex(ServiceError, "new actions are blocked"):
+                service.start_authorized_run(
+                    workflow["id"],
+                    lease["id"],
+                    "02x",
+                    {"qubits": ["q1"]},
+                    "Do not halt a paused lease.",
+                    "unittest-agent",
+                )
+            self.assertEqual(
+                service.autonomy_status(lease_id=lease["id"])["status"],
+                "paused",
+            )
+
     def test_pass_backed_decision_patch_is_delegated_and_committed(self) -> None:
         with tempfile.TemporaryDirectory() as folder:
             root = Path(folder)
@@ -1085,7 +1448,7 @@ class AutonomyTests(unittest.TestCase):
             )
             self.assertEqual(paused["status"], "paused")
             resumed = service.resume_autonomy(
-                lease["id"], "unit-test-human", AUTO_PHRASE
+                lease["id"], "unit-test-human", "恢復量測"
             )
             self.assertEqual(resumed["status"], "active")
             stopped = service.stop_autonomy(

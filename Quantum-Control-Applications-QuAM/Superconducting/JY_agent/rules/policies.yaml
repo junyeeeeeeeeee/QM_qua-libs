@@ -64,10 +64,21 @@ instrument_limits:
     max_aggregate_readout_amplitude: 0.5
 
 analysis:
+  resonator:
+    # Operator-supplied RF is already close. 02x/02c/02a only fine-tune.
+    max_frequency_span_mhz: 60.0
+    # Protected-node fits treat the readout LO (IF=0, detuning −IF) as a peak.
+    upconverter_exclusion_hz: 1000000.0
   statistics:
     # One requested statistics run contains 100 repetitions. Its raw iterations
     # are not re-fitted or used as an additional all-or-nothing acceptance gate.
     required_repetitions: 100
+  "02x":
+    # Visible interior dip is enough; 02x only fine-tunes stored resonator RF.
+    min_robust_snr: 3.0
+  "02a":
+    # Visible interior dressed dip is enough after 02c has set the point.
+    min_robust_snr: 3.0
   "04":
     # q3/q4/q5 reference run: 14.86 / 24.73 / 26.91 at 500 averages.
     # The floor is deliberately anchored just below the weakest accepted trace.
@@ -92,34 +103,48 @@ analysis:
     initial_coarse_span_mhz: 800.0
     initial_coarse_operation_amplitude_factor: 0.10
     coarse_min_span_mhz: 200.0
-    refinement_max_span_mhz: 100.0
+    # Do not chase 40–50 MHz windows; ~200 MHz is enough for refinement/fine.
+    refinement_max_span_mhz: 200.0
     refinement_max_operation_amplitude_factor: 0.10
-    final_max_span_mhz: 100.0
+    final_max_span_mhz: 200.0
     final_max_operation_amplitude_factor: 0.05
     final_min_feature_fwhm_mhz: 0.5
-    final_max_feature_fwhm_mhz: 10.0
-    min_robust_snr: 10.0
+    # Allow a moderately power-broadened fine peak; still reject ~20 MHz blobs.
+    final_max_feature_fwhm_mhz: 16.0
+    # Visible peak above noise; 5.25 was a documented noise-dominated miss.
+    min_robust_snr: 6.0
     min_edge_fraction: 0.05
     two_photon_detection_min_operation_amplitude_factor: 0.075
     two_photon_pair_min_separation_mhz: 50.0
     two_photon_pair_max_separation_mhz: 150.0
     two_photon_lower_max_width_ratio: 0.60
-    two_photon_min_peak_snr: 5.0
+    two_photon_min_peak_snr: 3.0
     two_photon_peak_min_distance_mhz: 10.0
     noise_confirmation_num_averages: [500, 1000, 2000]
     max_noise_confirmation_num_averages: 2000
   "02c":
     plateau_tail_fraction: 0.20
     min_plateau_points: 4
-    plateau_min_coverage: 0.70
+    # Accept a slightly wander-y plateau when dressed/bare remain distinct.
+    plateau_min_coverage: 0.55
     min_frequency_separation_steps: 4.0
-    plateau_band_steps: 2.0
-    plateau_band_fraction_of_separation: 0.15
-    max_plateau_width_steps: 4.0
-    max_plateau_width_fraction_of_separation: 0.35
+    plateau_band_steps: 4.0
+    plateau_band_fraction_of_separation: 0.25
+    max_plateau_width_steps: 8.0
+    max_plateau_width_fraction_of_separation: 0.55
     min_depletion_points: 2
     min_transition_monotonic_fraction: 0.70
     transition_monotonic_slack_fraction: 0.10
+    # Telling dressed from bare is the whole acceptance test. Each frequency
+    # must own this many consecutive classifiable power points.
+    min_classified_plateau_points: 2
+    # Operator rule (2026-09-18): the metrics below stay reported as advisory
+    # notes and no longer reject a run on their own. Set one to true to make it
+    # blocking again.
+    require_plateau_stability: false
+    require_plateau_width: false
+    require_depletion_points: false
+    require_transition_monotonic: false
     frequency_edge_fraction: 0.05
     selected_power_tolerance_steps: 2.0
     smoothing_window_points: 3
@@ -131,7 +156,9 @@ analysis:
     bare_only_min_num_averages: 200
     bare_only_min_readout_length_ns: 1000
     bare_only_min_low_power_snr: 5.0
-    bare_only_min_power_points: 40
+    bare_only_min_power_points: 30
+    max_num_power_points: 30
+    max_num_averages: 100
 
 state_commit:
   allowed_json_pointer_patterns:
@@ -181,8 +208,8 @@ nodes:
     flux_behavior: "hardcoded_min"
     defaults:
       num_averages: 300
-      frequency_span_in_mhz: 40.0
-      frequency_step_in_mhz: 0.1
+      frequency_span_in_mhz: 20.0
+      frequency_step_in_mhz: 0.05
       simulate: false
       simulation_duration_ns: 2500
       timeout: 100
@@ -204,7 +231,7 @@ nodes:
     script: "02c_resonator_spectroscopy_vs_amplitude.py"
     flux_behavior: "joint"
     defaults:
-      num_averages: 200
+      num_averages: 100
       frequency_span_in_mhz: 2.0
       frequency_step_in_mhz: 0.03
       simulate: false
@@ -212,7 +239,7 @@ nodes:
       timeout: 100
       max_power_dbm: -10
       min_power_dbm: -50
-      num_power_points: 40
+      num_power_points: 30
       max_amp: 0.5
       flux_point_joint_or_independent: "joint"
       ro_line_attenuation_dB: 0.0

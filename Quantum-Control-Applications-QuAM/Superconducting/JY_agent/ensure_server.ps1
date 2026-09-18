@@ -1,8 +1,6 @@
 param(
     [Parameter(Mandatory = $false)]
     [string]$Python = $env:JY_QUALIBRATE_PYTHON,
-    [Parameter(Mandatory = $false)]
-    [string]$QualibrateConfig = $env:QUALIBRATE_CONFIG_FILE,
     [ValidateSet("", "local", "public")]
     [string]$RemoteProvider = $env:JY_REMOTE_ACCESS_PROVIDER,
     [int]$McpPort = 8765,
@@ -131,9 +129,18 @@ function Read-OrCreate-PublicAccessToken {
     return [ordered]@{ path = $TokenPath; value = $Token }
 }
 
-function New-PublicBootstrapCode {
-    $CodePath = Join-Path $Runtime "public-dashboard-bootstrap.json"
-    $Bytes = New-Object byte[] 32
+function Read-OrCreate-DashboardPassword {
+    $PasswordPath = Join-Path $Runtime "dashboard-password.txt"
+    if (Test-Path -LiteralPath $PasswordPath -PathType Leaf) {
+        $Existing = (Get-Content -Raw -LiteralPath $PasswordPath).Trim()
+        if ($Existing.Length -ge 12 -and $Existing.Length -le 256 -and
+            $Existing -notmatch '[\r\n]') {
+            Set-PrivateFileAcl $PasswordPath
+            return [ordered]@{ path = $PasswordPath; value = $Existing; created = $false }
+        }
+        throw "The existing dashboard-password.txt must contain one 12-256 character password."
+    }
+    $Bytes = New-Object byte[] 18
     $Generator = [Security.Cryptography.RandomNumberGenerator]::Create()
     try {
         $Generator.GetBytes($Bytes)
@@ -141,27 +148,10 @@ function New-PublicBootstrapCode {
     finally {
         $Generator.Dispose()
     }
-    $Code = ([BitConverter]::ToString($Bytes) -replace "-", "").ToLowerInvariant()
-    $Hasher = [Security.Cryptography.SHA256]::Create()
-    try {
-        $HashBytes = $Hasher.ComputeHash([Text.Encoding]::UTF8.GetBytes($Code))
-    }
-    finally {
-        $Hasher.Dispose()
-    }
-    $CodeHash = ([BitConverter]::ToString($HashBytes) -replace "-", "").ToLowerInvariant()
-    $Record = [ordered]@{
-        code = $Code
-        code_sha256 = $CodeHash
-        # Keep fractional seconds within Python 3.10's six-digit ISO parser
-        # limit. Python also accepts older seven-digit records defensively.
-        created_at = [DateTimeOffset]::UtcNow.ToString("yyyy-MM-ddTHH:mm:ss.ffffffK")
-        expires_at = [DateTimeOffset]::UtcNow.AddMinutes(10).ToString("yyyy-MM-ddTHH:mm:ss.ffffffK")
-        used = $false
-    }
-    Write-AtomicJson $CodePath $Record
-    Set-PrivateFileAcl $CodePath
-    return [ordered]@{ path = $CodePath; value = $Code }
+    $Password = [Convert]::ToBase64String($Bytes).TrimEnd("=").Replace("+", "-").Replace("/", "_")
+    Write-AtomicText $PasswordPath $Password ([Text.Encoding]::ASCII)
+    Set-PrivateFileAcl $PasswordPath
+    return [ordered]@{ path = $PasswordPath; value = $Password; created = $true }
 }
 
 function Resolve-PublicTunnel([string]$Executable, [string]$Target, $SavedConfig) {
@@ -400,9 +390,8 @@ try {
 
 $Saved = Read-BootstrapConfig
 $Environment = Resolve-JyEnvironment `
-    $AgentRoot $Python $QualibrateConfig $Saved -RequireAgent
+    $AgentRoot $Python $Saved -RequireAgent
 $ResolvedPython = [string]$Environment.python
-$ResolvedQualibrateConfig = [string]$Environment.qualibrate_config
 $HardwareLock = Join-Path $Runtime "hardware.lock"
 $RecoveryOnly = $false
 if (Test-Path -LiteralPath $HardwareLock -PathType Leaf) {
@@ -415,7 +404,7 @@ if ($RecoveryOnly) {
 }
 if ([string]::IsNullOrWhiteSpace($RemoteProvider)) {
     # Local is a temporary recovery quarantine, not a persistent user
-    # preference.  Every normal entry defaults back to the token-protected
+    # preference.  Every normal entry defaults back to the password-protected
     # public Dashboard unless the caller explicitly requests local mode.
     $RemoteProvider = "public"
 }
@@ -425,8 +414,8 @@ $ApprovalBindHost = "127.0.0.1"
 $PublicBaseUrl = ""
 $ApprovalAccessToken = ""
 $ApprovalAccessTokenPath = ""
-$ApprovalBootstrapCode = ""
-$ApprovalBootstrapCodePath = ""
+$DashboardPasswordPath = ""
+$DashboardPasswordCreated = $false
 $PublicTunnelPid = 0
 
 if ($RemoteProvider -eq "public") {
@@ -434,9 +423,9 @@ if ($RemoteProvider -eq "public") {
     $TokenInfo = Read-OrCreate-PublicAccessToken
     $ApprovalAccessToken = [string]$TokenInfo.value
     $ApprovalAccessTokenPath = [string]$TokenInfo.path
-    $BootstrapCodeInfo = New-PublicBootstrapCode
-    $ApprovalBootstrapCode = [string]$BootstrapCodeInfo.value
-    $ApprovalBootstrapCodePath = [string]$BootstrapCodeInfo.path
+    $PasswordInfo = Read-OrCreate-DashboardPassword
+    $DashboardPasswordPath = [string]$PasswordInfo.path
+    $DashboardPasswordCreated = [bool]$PasswordInfo.created
     $ApprovalTarget = "http://127.0.0.1:$ApprovalPort"
     $TunnelInfo = Resolve-PublicTunnel $Cloudflared $ApprovalTarget $Saved
     $PublicTunnelPid = [int]$TunnelInfo.pid
@@ -450,6 +439,8 @@ elseif ($RemoteProvider -eq "local") {
     if ($RecoveryOnly) {
         Remove-Item -LiteralPath (Join-Path $Runtime "public-dashboard-access.token") `
             -Force -ErrorAction SilentlyContinue
+        # Remove any pre-password migration secret; never leave a replayable
+        # legacy bootstrap record in recovery-only mode.
         Remove-Item -LiteralPath (Join-Path $Runtime "public-dashboard-bootstrap.json") `
             -Force -ErrorAction SilentlyContinue
     }
@@ -498,8 +489,8 @@ $ConfigurationChanged = (
     [bool]$Saved.recovery_only -ne $RecoveryOnly -or
     [string]$Saved.approval_bind_host -ne $ApprovalBindHost -or
     [string]$Saved.public_base_url -ne $PublicBaseUrl -or
-    [string]$Saved.python -ne $ResolvedPython -or
-    [string]$Saved.qualibrate_config -ne $ResolvedQualibrateConfig
+    [string]$Saved.dashboard_password_path -ne $DashboardPasswordPath -or
+    [string]$Saved.python -ne $ResolvedPython
 )
 $RemoteApprovalExpected = $RemoteProvider -eq "public"
 $WrongMode = (
@@ -596,7 +587,6 @@ if ($RemoteProvider -eq "public") {
 
 $Bootstrap = [ordered]@{
     python = $ResolvedPython
-    qualibrate_config = $ResolvedQualibrateConfig
     remote_provider = $RemoteProvider
     approval_transport = $ApprovalTransport
     approval_bind_host = $ApprovalBindHost
@@ -607,7 +597,7 @@ $Bootstrap = [ordered]@{
     operator_console = "http://127.0.0.1:$McpPort/operator"
     approval_access_url = $PublicBaseUrl
     approval_access_token_path = $ApprovalAccessTokenPath
-    approval_bootstrap_code_path = $ApprovalBootstrapCodePath
+    dashboard_password_path = $DashboardPasswordPath
     public_tunnel_pid = $PublicTunnelPid
     mcp_pid = [int]$McpHealth.pid
     approval_pid = [int]$ApprovalHealth.pid
@@ -621,8 +611,10 @@ Set-PrivateFileAcl $BootstrapPath
 [ordered]@{
     status = if ($RecoveryOnly) { "recovery_only" } else { "ready" }
     mcp_endpoint = $Bootstrap.mcp_endpoint
-    approval_endpoint = if ($RemoteProvider -eq "public") { "$PublicBaseUrl/?bootstrap_code=$ApprovalBootstrapCode" } else { "http://127.0.0.1:$ApprovalPort" }
+    approval_endpoint = if ($RemoteProvider -eq "public") { $PublicBaseUrl } else { "http://127.0.0.1:$ApprovalPort" }
     remote_provider = $RemoteProvider
+    dashboard_password_path = if ($RemoteProvider -eq "public") { $DashboardPasswordPath } else { $null }
+    dashboard_password_created = $DashboardPasswordCreated
     started_pids = $StartedPids
     mcp_exposed_remotely = $false
     recovery_only = $RecoveryOnly

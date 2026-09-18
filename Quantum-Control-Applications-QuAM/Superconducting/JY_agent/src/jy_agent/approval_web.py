@@ -100,6 +100,7 @@ DASHBOARD_EVENT_TYPES = {
         "autonomy_lease_expired",
         "autonomy_scope_completed",
         "autonomy_resumed",
+        "measurement_mode_resumed",
         "workflow_stopped",
         "full_shutdown_requested",
         "hardware_lock_recovered",
@@ -166,6 +167,7 @@ _ZH_ENUMS = {
     "completed": "已完成",
     "failed": "失敗",
     "instrument_unreachable": "儀器無法連線",
+    "qop_compile_failure": "QOP 編譯失敗",
     "pass": "通過",
     "needs_review": "需要審閱",
     "manual_review": "人工審閱",
@@ -481,7 +483,7 @@ async def handle_autonomy_control(
         principal,
         success=_ui(
             language,
-            f"控制已套用：{result['status']}。",
+            f"控制已套用：{_localized_enum(language, result['status'])}。",
             f"Control applied: {result['status']}.",
         ),
         language=language,
@@ -711,7 +713,7 @@ async def handle_session_dashboard(
             )
             success = _ui(
                 language,
-                f"控制已套用：{result['status']}。",
+                f"控制已套用：{_localized_enum(language, result['status'])}。",
                 f"Control applied: {result['status']}.",
             )
         elif operation == "shutdown":
@@ -1119,6 +1121,13 @@ button {{ margin-top:12px; border:0; color:white; background:#3568e8; font-weigh
 def _instrument_pause_notice(
     review: dict[str, Any], language: str = "zh-Hant"
 ) -> str:
+    session = review.get("session") or {}
+    authorization = session.get("authorization") or {}
+    currently_paused = session.get("status") == "paused" or authorization.get(
+        "status"
+    ) == "paused"
+    if not currently_paused:
+        return ""
     for item in reversed(review.get("history", [])):
         analysis = item.get("analysis") or {}
         if analysis.get("failure_category") != "instrument_unreachable":
@@ -1142,7 +1151,7 @@ def _instrument_pause_notice(
           <h2>{_ui(language, '儀器錯誤：量測已暫停', 'Instrument error: measurement paused')}</h2>
           <p>{escape(str(message))}</p>
           {quarantine}
-          <p>{_ui(language, '連線恢復後，回 AI 對話重新輸入原本的進入量測模式指令；若要結束，輸入「結束量測」／“End measurement”。若重新進入仍失敗，輸入「恢復」／“Recover”。', 'After connectivity returns, re-enter the original JY mode in the AI conversation. To finish, send “End measurement”; if entry still fails, send “Recover”.')}</p>
+          <p>{_ui(language, '現場確認儀器可連線後，請用此頁「繼續排程」，或回 AI 對話輸入「恢復量測」／“Resume measurement”；目前節點會以新 run 從頭執行。', 'After connectivity is restored, use Resume scheduling on this page, or send “Resume measurement” in the AI conversation. The current node restarts as a new run.')}</p>
         </section>"""
     return ""
 

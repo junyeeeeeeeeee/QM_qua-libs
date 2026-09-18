@@ -218,6 +218,39 @@ class SnapshotAnalyzer:
                         f"{max_width / 1e6:g} MHz range."
                     )
 
+        if node_id in {"02x", "02a"}:
+            resonator_rules = self.policy.raw.get("analysis", {}).get("resonator", {})
+            exclusion_hz = float(
+                resonator_rules.get("upconverter_exclusion_hz", 1_000_000.0)
+            )
+            try:
+                current_for_lo = load_state(self.settings.active_state)
+            except Exception:
+                current_for_lo = {}
+            for name, metrics in dataset_metrics.get("qubits", {}).items():
+                if not isinstance(metrics, dict):
+                    continue
+                if metrics.get("sweep_dimension") not in {None, "freq"}:
+                    continue
+                feature = metrics.get("feature_coordinate")
+                if not _finite(feature):
+                    continue
+                current_if = (
+                    current_for_lo.get("qubits", {})
+                    .get(name, {})
+                    .get("resonator", {})
+                    .get("intermediate_frequency")
+                )
+                if not _finite(current_if):
+                    continue
+                # Dataset `freq` is detuning from resonator RF. The LO/upconverter
+                # artifact sits at detuning -IF.
+                if abs(float(feature) + float(current_if)) <= exclusion_hz:
+                    failures.append(
+                        f"{name} selected feature is within {exclusion_hz / 1e6:g} MHz "
+                        "of the readout upconverter frequency and must not be used."
+                    )
+
         candidate_patch: list[dict[str, Any]] = []
         rejected_patch: list[dict[str, Any]] = []
         snapshot_state = snapshot_state_path(snapshot)

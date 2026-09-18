@@ -9,29 +9,41 @@ through a Cloudflare HTTPS quick tunnel. MCP remains on `127.0.0.1:8765` and is
 never forwarded. The public surface exposes only the shared Home, review,
 approval, result plots, history selection, and four operator control states.
 
-每個 service lifetime 都有只留在量測電腦檔案系統內的 256-bit access secret。
-entry response 的初次 URL 只帶獨立、短效、一次性的 bootstrap code；第一次成功
-開啟後，server 會為該瀏覽器建立 12 小時、`HttpOnly`、`Secure`、
-`SameSite=Strict` 的個別 device cookie，並立即從網址移除 code。初次 URL 用過後
-不能再拿去開手機，這是預期的 replay 防護，不是 Dashboard 故障。
+公開網址本身不帶 token 或 bootstrap query。任何手機或瀏覽器都直接開啟當次
+`https://…trycloudflare.com/`，再輸入量測電腦上
+`JY_agent/runtime/dashboard-password.txt` 內的固定密碼。首次正常啟動若檔案
+不存在，Ensure 會安全產生一次、限制檔案 ACL，之後 server 或 tunnel 重啟都沿用
+同一密碼；檔案被 `.gitignore` 排除，密碼不會被 commit、寫入 URL 或啟動日誌。
 
-Each service lifetime keeps a random 256-bit access secret on the lab PC. The
-initial entry URL carries only a separate short-lived, single-use bootstrap code.
-After exchange, the server creates a unique 12-hour `HttpOnly`, `Secure`,
-`SameSite=Strict` device cookie and removes the code from the address bar. Reusing
-that initial URL on a phone is intentionally rejected as a replay.
+The public URL contains no token or bootstrap query. Every phone or browser opens
+the current `https://…trycloudflare.com/` directly and enters the fixed password
+stored in `JY_agent/runtime/dashboard-password.txt`. Ensure securely generates
+the ignored, ACL-restricted file once when missing and reuses it across server and
+tunnel restarts. The password is never committed, placed in a URL, or printed in
+startup logs.
 
-要連接手機或第二個瀏覽器，請在量測電腦開啟
-`http://127.0.0.1:8765/operator`，輸入裝置名稱並建立 10 分鐘的一次性配對連結，
-再把該連結傳到指定裝置。每台裝置取得不同 cookie，可在同一本機頁面個別撤銷；
-原桌面不會因手機配對或撤銷而失效。不要公開、截圖或長期保存 bootstrap／配對
-連結。Quick tunnel hostname 在服務重建後可能改變，請使用當次 entry response。
+登入成功後，每個瀏覽器取得各自 12 小時、`HttpOnly`、`Secure`、
+`SameSite=Strict` 的 cookie；不需要 Pair another phone/browser。登入端點有基本
+失敗次數限制。可直接修改密碼檔；若要同時讓所有既有 cookie 失效，修改後完整停止
+並重新啟動 JY 服務，使 service instance nonce 一併輪替。
 
-To connect a phone or second browser, open `http://127.0.0.1:8765/operator` on
-the lab PC, name the device, and create a ten-minute single-use pairing link.
-Each device receives an independent cookie that can be revoked locally without
-invalidating the desktop. Do not publish or retain bootstrap/pairing links. The
-quick-tunnel hostname can change after restart, so use the current entry result.
+After login, each browser receives its own 12-hour `HttpOnly`, `Secure`,
+`SameSite=Strict` cookie. There is no device-pairing step, and failed logins are
+rate-limited. The password file can be edited directly. To invalidate every
+already-issued cookie as well, fully stop and restart JY after changing it so the
+service instance nonce rotates.
+
+本機與公開入口如下：
+
+- MCP：`http://127.0.0.1:8765/mcp`（不是量測網站，永不公開）。
+- 現場 recovery console：`http://127.0.0.1:8765/operator`（永不公開）。
+- 本機 Dashboard：`http://127.0.0.1:8766/`。
+- 公開 Dashboard：當次 Ensure 回傳的 `https://…trycloudflare.com/`。
+
+The loopback MCP and operator console remain private. Dashboard is locally served
+at `http://127.0.0.1:8766/`; only that port is forwarded to the current
+Cloudflare quick-tunnel hostname. A newly created quick tunnel may use a different
+hostname, so use the URL returned by the current Ensure/entry result.
 
 手機不需 VPN App。它只需要一般瀏覽器開啟 public URL；AI 對話仍透過手機 remote
 回量測電腦的既有 agent task。若 tunnel 建立失敗，JY 不會改用 LAN binding，也

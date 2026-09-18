@@ -1,12 +1,10 @@
 from __future__ import annotations
 
-import hashlib
 import hmac
-import json
 import os
-from datetime import datetime, timezone
-from pathlib import Path
-from urllib.parse import urlencode
+import time
+from html import escape
+from urllib.parse import parse_qs, urlencode
 
 from starlette.applications import Starlette
 from starlette.requests import Request
@@ -29,7 +27,22 @@ from .approval_web import (
 from .config import Settings
 from .dashboard_access import DashboardAccessManager
 from .service import AgentService
-from .util import atomic_write_json, exclusive_file_lock, parse_iso_datetime
+
+
+DASHBOARD_PASSWORD_FILENAME = "dashboard-password.txt"
+DASHBOARD_COOKIE = "jy_dashboard_access"
+LOGIN_WINDOW_SECONDS = 5 * 60
+LOGIN_MAX_FAILURES = 5
+LOGIN_SECURITY_HEADERS = {
+    "Cache-Control": "no-store",
+    "Content-Security-Policy": (
+        "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; "
+        "base-uri 'none'; frame-ancestors 'none'"
+    ),
+    "Referrer-Policy": "no-referrer",
+    "X-Content-Type-Options": "nosniff",
+    "X-Frame-Options": "DENY",
+}
 
 
 def create_approval_app(settings: Settings | None = None) -> Starlette:
@@ -37,6 +50,7 @@ def create_approval_app(settings: Settings | None = None) -> Starlette:
     resolved = settings or Settings.load()
     service = AgentService(resolved)
     dashboard_access = DashboardAccessManager(service.db)
+    login_failures: dict[str, list[float]] = {}
 
     async def approval(request: Request) -> Response:
         return await handle_browser_approval(request, service)
@@ -98,21 +112,26 @@ def create_approval_app(settings: Settings | None = None) -> Starlette:
             }
         )
 
-    async def device_pair(request: Request) -> Response:
-        if service.current_dashboard_session_id() is None:
-            return HTMLResponse(
-                "<!doctype html><html><body><h1>Device paired</h1>"
-                "<p>No JY measurement session is currently open.</p></body></html>",
-                status_code=200,
-            )
-        return RedirectResponse("/", status_code=303)
+    async def login(request: Request) -> Response:
+        return await _handle_login(
+            request,
+            resolved,
+            dashboard_access,
+            login_failures,
+        )
+
+    async def logout(request: Request) -> Response:
+        response = RedirectResponse("/login", status_code=303)
+        response.delete_cookie(DASHBOARD_COOKIE, path="/")
+        return response
 
     app = Starlette(
         debug=False,
         routes=[
             Route("/", dashboard_entry, methods=["GET"], name="dashboard_entry"),
             Route("/healthz", healthz, methods=["GET"], name="healthz"),
-            Route("/device-pair", device_pair, methods=["GET"], name="device_pair"),
+            Route("/login", login, methods=["GET", "POST"], name="login"),
+            Route("/logout", logout, methods=["GET", "POST"], name="logout"),
             Route(
                 "/approve/{proposal_id}",
                 approval,
@@ -219,7 +238,7 @@ def create_approval_app(settings: Settings | None = None) -> Starlette:
     )
 
     @app.middleware("http")
-    async def public_access_token(request: Request, call_next):
+    async def public_password_access(request: Request, call_next):
         if resolved.approval_transport != "public":
             return await call_next(request)
         expected = resolved.approval_access_token or ""
@@ -230,90 +249,185 @@ def create_approval_app(settings: Settings | None = None) -> Starlette:
             and hmac.compare_digest(health_token, expected)
         ):
             return await call_next(request)
-        bootstrap_code = request.query_params.get("bootstrap_code", "")
-        pairing_code = request.query_params.get("pairing_code", "")
-        cookie = request.cookies.get("jy_dashboard_access", "")
+        if request.url.path in {"/login", "/logout"}:
+            return await call_next(request)
+        cookie = request.cookies.get(DASHBOARD_COOKIE, "")
         device = dashboard_access.validate_device(cookie)
-        issued_device: dict[str, object] | None = None
-        if request.method == "GET" and pairing_code:
-            issued_device = dashboard_access.consume_pairing(
-                pairing_code, actor="browser paired through public HTTPS"
-            )
-        elif (
-            request.method == "GET"
-            and bootstrap_code
-            and _consume_public_bootstrap_code(resolved.runtime, bootstrap_code)
-        ):
-            issued_device = dashboard_access.issue_initial_device(
-                actor="initial public dashboard bootstrap"
-            )
-        if issued_device is None and device is None:
-            return HTMLResponse(
-                "<!doctype html><html><body><h1>Forbidden</h1>"
-                "<p>This device is not paired with the JY Dashboard. Create a "
-                "short-lived device link from the local operator console on the "
-                "lab PC.</p></body></html>",
-                status_code=403,
-            )
-        if issued_device is not None:
-            query = [
-                (key, value)
-                for key, value in request.query_params.multi_items()
-                if key not in {"bootstrap_code", "pairing_code"}
-            ]
+        if device is None:
             target = request.url.path
-            if query:
-                target += "?" + urlencode(query)
-            response = RedirectResponse(target, status_code=303)
-        else:
-            request.state.jy_public_authenticated = True
-            response = await call_next(request)
-        if issued_device is not None:
-            response.set_cookie(
-                "jy_dashboard_access",
-                str(issued_device["token"]),
-                max_age=12 * 60 * 60,
-                httponly=True,
-                secure=True,
-                samesite="strict",
-                path="/",
+            if request.url.query:
+                target += "?" + request.url.query
+            return RedirectResponse(
+                "/login?" + urlencode({"next": target}),
+                status_code=303,
             )
-        return response
+        request.state.jy_public_authenticated = True
+        return await call_next(request)
 
     return app
 
 
-def _consume_public_bootstrap_code(
-    runtime: os.PathLike[str], supplied: str
-) -> bool:
-    """Consume one short-lived browser bootstrap code exactly once."""
-    runtime_path = os.fspath(runtime)
-    code_path = os.path.join(runtime_path, "public-dashboard-bootstrap.json")
-    lock_path = os.path.join(runtime_path, "public-dashboard-bootstrap.lock")
-    if not os.path.isfile(code_path):
-        return False
+async def _handle_login(
+    request: Request,
+    settings: Settings,
+    access: DashboardAccessManager,
+    failures: dict[str, list[float]],
+) -> Response:
+    next_path = _safe_next_path(request.query_params.get("next", "/"))
+    if request.method == "GET":
+        return _login_page(next_path)
+
+    client_key = _login_client_key(request)
+    retry_after = _login_retry_after(failures, client_key)
+    if retry_after > 0:
+        return _login_page(
+            next_path,
+            error="登入嘗試過多，請稍後再試。 / Too many attempts; try again later.",
+            status_code=429,
+            headers={"Retry-After": str(retry_after)},
+        )
     try:
-        with exclusive_file_lock(Path(lock_path), "public dashboard bootstrap exchange"):
-            record = json.loads(Path(code_path).read_text(encoding="utf-8-sig"))
-            expires_at = parse_iso_datetime(record.get("expires_at", ""))
-            if expires_at.tzinfo is None:
-                expires_at = expires_at.replace(tzinfo=timezone.utc)
-            supplied_hash = hashlib.sha256(supplied.encode("utf-8")).hexdigest()
-            if (
-                bool(record.get("used"))
-                or expires_at <= datetime.now(timezone.utc)
-                or not hmac.compare_digest(
-                    supplied_hash, str(record.get("code_sha256", ""))
-                )
-            ):
-                return False
-            record["used"] = True
-            record["used_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
-            record.pop("code", None)
-            atomic_write_json(Path(code_path), record)
-            return True
-    except (OSError, ValueError, RuntimeError, TypeError):
-        return False
+        if not request.headers.get("content-type", "").lower().startswith(
+            "application/x-www-form-urlencoded"
+        ):
+            raise ValueError("Invalid login form encoding")
+        body = await request.body()
+        if len(body) > 4096:
+            raise ValueError("Login form was too large")
+        fields = parse_qs(
+            body.decode("utf-8"),
+            keep_blank_values=True,
+            strict_parsing=True,
+            max_num_fields=3,
+        )
+        passwords = fields.get("password", [])
+        next_values = fields.get("next", [next_path])
+        if len(passwords) != 1 or len(next_values) != 1:
+            raise ValueError("Invalid login form")
+        supplied = passwords[0]
+        next_path = _safe_next_path(next_values[0])
+    except (UnicodeDecodeError, ValueError):
+        return _login_page(
+            next_path,
+            error="登入資料格式錯誤。 / Invalid login request.",
+            status_code=400,
+        )
+    try:
+        expected = _read_dashboard_password(settings)
+    except (OSError, ValueError):
+        return _login_page(
+            next_path,
+            error="Dashboard 密碼目前無法使用，請由量測電腦檢查密碼檔。 / "
+            "Dashboard password unavailable; inspect the password file on the lab PC.",
+            status_code=503,
+        )
+
+    if not hmac.compare_digest(supplied, expected):
+        failures.setdefault(client_key, []).append(time.monotonic())
+        return _login_page(
+            next_path,
+            error="密碼錯誤。 / Incorrect password.",
+            status_code=401,
+        )
+
+    failures.pop(client_key, None)
+    session = access.issue_password_session(
+        actor=f"Dashboard password login from {client_key}"
+    )
+    response = RedirectResponse(next_path, status_code=303)
+    response.set_cookie(
+        DASHBOARD_COOKIE,
+        str(session["token"]),
+        max_age=12 * 60 * 60,
+        httponly=True,
+        secure=True,
+        samesite="strict",
+        path="/",
+    )
+    return response
+
+
+def _read_dashboard_password(settings: Settings) -> str:
+    password_path = settings.runtime / DASHBOARD_PASSWORD_FILENAME
+    password = password_path.read_text(encoding="utf-8-sig").strip()
+    if not 12 <= len(password) <= 256 or "\n" in password or "\r" in password:
+        raise ValueError(
+            f"{DASHBOARD_PASSWORD_FILENAME} must contain one 12-256 character password"
+        )
+    return password
+
+
+def _login_page(
+    next_path: str,
+    *,
+    error: str | None = None,
+    status_code: int = 200,
+    headers: dict[str, str] | None = None,
+) -> HTMLResponse:
+    notice = (
+        f'<p class="error" role="alert">{escape(error)}</p>' if error else ""
+    )
+    html = f"""<!doctype html><html lang="zh-Hant"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>JY Dashboard login</title><style>
+:root{{color-scheme:dark;font-family:system-ui,-apple-system,sans-serif}}
+*{{box-sizing:border-box}}body{{margin:0;min-height:100vh;display:grid;place-items:center;
+background:#08101d;color:#edf4ff;padding:20px}}main{{width:min(420px,100%);
+background:#121d31;border:1px solid #2b3b5d;border-radius:16px;padding:24px}}
+h1{{margin-top:0}}label{{display:block;margin:18px 0 8px}}input,button{{width:100%;
+padding:12px;border-radius:9px;font:inherit}}input{{background:#07101f;color:white;
+border:1px solid #6680b5}}button{{margin-top:14px;border:0;background:#3568e8;
+color:white;font-weight:750;cursor:pointer}}.muted{{color:#b7c4df}}.error{{background:#5a1e2a;
+padding:11px;border-radius:8px}}
+</style></head><body><main><h1>JY 量測 Dashboard</h1>
+<p class="muted">請輸入實驗室固定密碼。<br>Enter the shared lab password.</p>
+{notice}<form method="post" action="/login">
+<input type="hidden" name="next" value="{escape(_safe_next_path(next_path))}">
+<label for="password">密碼 / Password</label>
+<input id="password" name="password" type="password" autocomplete="current-password"
+autofocus required maxlength="256"><button type="submit">登入 / Sign in</button>
+</form></main></body></html>"""
+    response_headers = dict(LOGIN_SECURITY_HEADERS)
+    if headers:
+        response_headers.update(headers)
+    return HTMLResponse(html, status_code=status_code, headers=response_headers)
+
+
+def _safe_next_path(value: str) -> str:
+    candidate = str(value or "/")
+    if (
+        not candidate.startswith("/")
+        or candidate.startswith("//")
+        or "\r" in candidate
+        or "\n" in candidate
+    ):
+        return "/"
+    return candidate
+
+
+def _login_client_key(request: Request) -> str:
+    return (
+        request.headers.get("cf-connecting-ip")
+        or (request.client.host if request.client else "unknown")
+    ).strip()[:128]
+
+
+def _login_retry_after(
+    failures: dict[str, list[float]], client_key: str
+) -> int:
+    now = time.monotonic()
+    recent = [
+        attempted
+        for attempted in failures.get(client_key, [])
+        if now - attempted < LOGIN_WINDOW_SECONDS
+    ]
+    if recent:
+        failures[client_key] = recent
+    else:
+        failures.pop(client_key, None)
+    if len(recent) < LOGIN_MAX_FAILURES:
+        return 0
+    return max(1, int(LOGIN_WINDOW_SECONDS - (now - recent[0])))
 
 
 def run_approval_server(
@@ -330,8 +444,7 @@ def run_approval_server(
         host=host or resolved.approval_host,
         port=port or resolved.approval_port,
         log_level="info",
-        # Browser bootstrap codes are query parameters for one request.  Never
-        # let an HTTP access logger persist them.
+        # Avoid persisting login endpoints, client addresses, or dashboard paths.
         access_log=False,
     )
 

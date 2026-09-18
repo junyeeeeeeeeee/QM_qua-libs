@@ -23,7 +23,7 @@ paths:
 qualibrate_python: ""
 
 workflow:
-  sequence: ["02x", "02a", "02c", "03a", "04", "05", "07b", "06", "06b", "10a", "05st", "06st_t2star", "06st_t2e"]
+  sequence: ["02x", "02c", "02a", "03a", "04", "05", "07b", "06", "06b", "10a", "05st", "06st_t2star", "06st_t2e"]
   default_flux_point: "joint"
   require_explicit_qubits: true
 
@@ -77,3 +77,8 @@ interaction:
     - "恢復"
     - "恢复"
     - "Recover"
+  # Resume the same paused workflow/session after an operator verifies instruments.
+  measurement_resume_phrases:
+    - "恢復量測"
+    - "恢复量测"
+    - "Resume measurement"

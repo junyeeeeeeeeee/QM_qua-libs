@@ -43,7 +43,7 @@ from jy_agent.state import (
     recorded_updates_to_patch,
 )
 from jy_agent.util import atomic_write_json, json_compatible, json_dumps, sha256_file
-from jy_agent.worker import _restore_state_if_changed
+from jy_agent.worker import _assert_active_state_source, _restore_state_if_changed
 
 
 AGENT_ROOT = Path(__file__).resolve().parents[1]
@@ -89,7 +89,8 @@ def sample_state(x180: float = 0.0, x90: float = 0.0) -> dict:
                 },
                 "extras": {},
             }
-        }
+        },
+        "active_qubit_names": ["q1"],
     }
 
 
@@ -104,7 +105,7 @@ def sample_multiplex_state_and_wiring() -> tuple[dict, dict, list[str]]:
         "q8": -77_000_000,
     }
     template = sample_state(0.2, 0.1)["qubits"]["q1"]
-    state = {"qubits": {}}
+    state = {"qubits": {}, "active_qubit_names": list(targets)}
     wiring = {"wiring": {"qubits": {}}}
     for name in targets:
         qubit = deepcopy(template)
@@ -146,7 +147,7 @@ def make_settings(temp_root: Path, state: dict | None = None) -> Settings:
         port=8765,
         mcp_path="/mcp",
         qualibrate_python=Path(sys.executable),
-        workflow_sequence=("02x", "02a", "02c", "03a", "04", "05"),
+        workflow_sequence=("02x", "02c", "02a", "03a", "04", "05"),
         require_explicit_qubits=True,
         measurement_mode_entry_phrase=ENTRY_PHRASE,
         measurement_mode_exit_phrase=EXIT_PHRASE,
@@ -221,13 +222,56 @@ class CoreTests(unittest.TestCase):
                 ),
             )
 
-            service.poll_run("conversation-instrument-offline")
+            polled = service.poll_run("conversation-instrument-offline")
 
             self.assertEqual(service._workflow(workflow_id)["status"], "paused")
+            self.assertEqual(polled["operator_handoff"]["reply"], "恢復量測")
+            self.assertIn("完成後回傳: 恢復量測", polled["operator_handoff"]["chat"])
+            self.assertIn(
+                "如需結束量測，請於網頁首頁結束量測後再對話輸入「結束量測」。",
+                polled["operator_handoff"]["chat"],
+            )
             self.assertEqual(
                 service.dashboard_status(entered["dashboard"]["id"])["status"],
                 "paused",
             )
+
+            resumed = service.resume_measurement_mode(
+                workflow_id,
+                "on-site-operator",
+                "恢復量測",
+            )
+            self.assertEqual(resumed["status"], "active")
+            self.assertEqual(resumed["current_node"], "02x")
+            self.assertEqual(
+                resumed["resume_policy"],
+                "restart_current_node_as_new_run",
+            )
+            self.assertEqual(
+                service.dashboard_status(entered["dashboard"]["id"])["status"],
+                "active",
+            )
+
+    def test_resume_measurement_refuses_retained_hardware_lock(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            settings = make_settings(Path(folder), sample_state(0.2, 0.1))
+            service = AgentService(settings)
+            entered = service.enter_measurement_mode(
+                "unittest-agent", ENTRY_PHRASE, ["q1"]
+            )
+            workflow_id = entered["workflow"]["id"]
+            service.db.execute(
+                "UPDATE workflows SET status = 'paused' WHERE id = ?",
+                (workflow_id,),
+            )
+            atomic_write_json(settings.lock_path, {"run_id": "unverified-worker-exit"})
+
+            with self.assertRaisesRegex(Exception, "recovery-only quarantine"):
+                service.resume_measurement_mode(
+                    workflow_id,
+                    "on-site-operator",
+                    "恢復量測",
+                )
 
     def test_recover_close_converges_open_workflow_without_deleting_lock(self) -> None:
         with tempfile.TemporaryDirectory() as folder:
@@ -391,6 +435,93 @@ class CoreTests(unittest.TestCase):
                         "frequency_step_in_mhz": 1,
                     },
                 )
+
+    def test_02x_rejects_span_above_60_mhz(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            settings = make_settings(Path(folder), sample_state(0.2, 0.1))
+            policy = PolicyEngine(settings)
+            with self.assertRaisesRegex(PolicyError, "60 MHz"):
+                policy.validate_run(
+                    "02x",
+                    {
+                        "qubits": ["q1"],
+                        "frequency_span_in_mhz": 80,
+                        "frequency_step_in_mhz": 0.1,
+                    },
+                )
+
+    def test_02x_rejects_sweep_that_includes_upconverter(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            state = sample_state(0.2, 0.1)
+            state["qubits"]["q1"]["resonator"]["intermediate_frequency"] = 10_000_000
+            settings = make_settings(Path(folder), state)
+            policy = PolicyEngine(settings)
+            with self.assertRaisesRegex(PolicyError, "upconverter"):
+                policy.validate_run(
+                    "02x",
+                    {
+                        "qubits": ["q1"],
+                        "frequency_span_in_mhz": 20,
+                        "frequency_step_in_mhz": 0.05,
+                    },
+                )
+
+    def test_02x_allows_20_mhz_span_away_from_upconverter(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            settings = make_settings(Path(folder), sample_state(0.2, 0.1))
+            policy = PolicyEngine(settings)
+            merged, _ = policy.validate_run(
+                "02x",
+                {
+                    "qubits": ["q1"],
+                    "frequency_span_in_mhz": 20,
+                    "frequency_step_in_mhz": 0.05,
+                },
+            )
+            self.assertEqual(merged["frequency_span_in_mhz"], 20)
+
+    def test_02c_rejects_more_than_30_power_points(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            settings = make_settings(Path(folder), sample_state(0.2, 0.1))
+            policy = PolicyEngine(settings)
+            with self.assertRaisesRegex(PolicyError, "num_power_points"):
+                policy.validate_run(
+                    "02c",
+                    {
+                        "qubits": ["q1"],
+                        "num_power_points": 40,
+                        "num_averages": 100,
+                    },
+                )
+
+    def test_02c_rejects_more_than_100_averages(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            settings = make_settings(Path(folder), sample_state(0.2, 0.1))
+            policy = PolicyEngine(settings)
+            with self.assertRaisesRegex(PolicyError, "num_averages"):
+                policy.validate_run(
+                    "02c",
+                    {
+                        "qubits": ["q1"],
+                        "num_power_points": 30,
+                        "num_averages": 200,
+                    },
+                )
+
+    def test_02c_allows_30_power_points_and_100_averages(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            settings = make_settings(Path(folder), sample_state(0.2, 0.1))
+            policy = PolicyEngine(settings)
+            merged, _ = policy.validate_run(
+                "02c",
+                {
+                    "qubits": ["q1"],
+                    "num_power_points": 30,
+                    "num_averages": 100,
+                },
+            )
+            self.assertEqual(merged["num_power_points"], 30)
+            self.assertEqual(merged["num_averages"], 100)
 
     def test_04_rejects_waveform_limit_violation(self) -> None:
         with tempfile.TemporaryDirectory() as folder:
@@ -625,6 +756,27 @@ class CoreTests(unittest.TestCase):
             self.assertIsNone(error)
             self.assertEqual(sha256_file(active), before_hash)
 
+    def test_worker_requires_same_state_source_as_quam_load(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            expected_root = root / "expected"
+            expected_root.mkdir()
+            expected_state = expected_root / "state.json"
+            other_state = root / "other" / "state.json"
+            other_state.parent.mkdir()
+            atomic_write_json(expected_state, sample_state(0.2, 0.1))
+            atomic_write_json(other_state, sample_state(0.2, 0.1))
+
+            with patch(
+                "quam_libs.components.quam_root.QuAM.get_quam_state_path",
+                return_value=expected_root,
+            ):
+                _assert_active_state_source(expected_state)
+                with self.assertRaisesRegex(
+                    RuntimeError, "ACTIVE_STATE_SOURCE_MISMATCH"
+                ):
+                    _assert_active_state_source(other_state)
+
     def test_idempotent_mutation_replays_only_matching_completed_request(self) -> None:
         with tempfile.TemporaryDirectory() as folder:
             service = AgentService(
@@ -854,7 +1006,7 @@ class CoreTests(unittest.TestCase):
                 run_id,
                 "advance",
                 "Evidence passes.",
-                "02a",
+                "02c",
                 {},
                 [],
                 "unittest",
@@ -1028,7 +1180,7 @@ class CoreTests(unittest.TestCase):
                     "stopped",
                 )
 
-    def test_settings_loads_paths_only_from_qualibrate_config(self) -> None:
+    def test_settings_loads_paths_only_from_home_qualibrate_config(self) -> None:
         with tempfile.TemporaryDirectory() as folder:
             root = Path(folder)
             agent_root = root / "JY_agent"
@@ -1045,7 +1197,9 @@ class CoreTests(unittest.TestCase):
             data_root.mkdir()
             calibration_graph = root / "calibration_graph"
             calibration_graph.mkdir()
-            config_path = root / "qualibrate.toml"
+            home = root / "home"
+            config_path = home / ".qualibrate" / "config.toml"
+            config_path.parent.mkdir(parents=True)
             config_path.write_text(
                 "\n".join(
                     [
@@ -1062,9 +1216,11 @@ class CoreTests(unittest.TestCase):
                 ),
                 encoding="utf-8",
             )
-            with patch.dict(
+            with patch(
+                "jy_agent.config.Path.home", return_value=home
+            ), patch.dict(
                 os.environ,
-                {"QUALIBRATE_CONFIG_FILE": str(config_path)},
+                {"QUALIBRATE_CONFIG_FILE": str(root / "wrong-config.toml")},
             ):
                 settings = Settings.load(agent_root)
             self.assertEqual(settings.active_state, state_root / "state.json")
@@ -1072,6 +1228,7 @@ class CoreTests(unittest.TestCase):
             self.assertEqual(settings.data_root, data_root)
             self.assertEqual(settings.calibration_graph, calibration_graph)
             self.assertEqual(settings.qualibrate_project, "test-project")
+            self.assertEqual(settings.qualibrate_config_path, config_path.resolve())
 
 
 class AnalysisTests(unittest.TestCase):
@@ -1402,6 +1559,91 @@ class AnalysisTests(unittest.TestCase):
         self.assertIsNone(
             selected_readout_power_dbm(
                 {"full_scale_power_dbm": -2, "amplitude": 0.05}
+            )
+        )
+
+    def test_02c_accepts_moderately_wide_plateaus(self) -> None:
+        power = np.linspace(-50.0, -10.0, 41)
+        frequency = np.linspace(-10_000_000.0, 10_000_000.0, 201)
+        dressed = 2_000_000.0
+        bare = -3_000_000.0
+        tracked = np.empty_like(power)
+        for index, value in enumerate(power):
+            if value <= -34.0:
+                tracked[index] = dressed + 1_200_000.0 * np.sin(index)
+            elif value >= -26.0:
+                tracked[index] = bare + 1_200_000.0 * np.sin(index)
+            else:
+                fraction = (value + 34.0) / 8.0
+                tracked[index] = dressed + fraction * (bare - dressed)
+        dataset = xr.Dataset(
+            {"rr_min_response": (("qubit", "power_dbm"), tracked[None, :])},
+            coords={
+                "qubit": ["q1"],
+                "power_dbm": power,
+                "freq": frequency,
+            },
+        )
+        transition = analyze_02c_transitions(dataset)["qubits"]["q1"]
+        self.assertEqual(transition["validation_failures"], [])
+        self.assertGreater(transition["dressed_plateau_width_hz"], 1_750_000.0)
+        self.assertGreaterEqual(transition["depletion_point_count"], 2)
+
+    def test_02c_accepts_bimodal_transition_without_depletion_points(self) -> None:
+        """Separable dressed/bare passes even when the middle is unjudgeable."""
+        power = np.linspace(-50.0, -10.0, 41)
+        frequency = np.linspace(-10_000_000.0, 10_000_000.0, 201)
+        dressed = 2_000_000.0
+        bare = -3_000_000.0
+        tracked = np.empty_like(power)
+        for index, value in enumerate(power):
+            if value <= -34.0:
+                tracked[index] = dressed
+            elif value >= -26.0:
+                tracked[index] = bare
+            else:
+                # Jumps between the two frequencies instead of drifting: no
+                # intermediate points and a non-monotonic transition.
+                tracked[index] = bare if index % 2 else dressed
+        dataset = xr.Dataset(
+            {"rr_min_response": (("qubit", "power_dbm"), tracked[None, :])},
+            coords={
+                "qubit": ["q1"],
+                "power_dbm": power,
+                "freq": frequency,
+            },
+        )
+        transition = analyze_02c_transitions(dataset)["qubits"]["q1"]
+        self.assertEqual(transition["validation_failures"], [])
+        self.assertEqual(transition["depletion_point_count"], 0)
+        self.assertTrue(
+            any("depletion" in note for note in transition["advisory_notes"])
+        )
+        self.assertGreaterEqual(transition["dressed_classified_point_count"], 2)
+        self.assertGreaterEqual(transition["bare_classified_point_count"], 2)
+        # The proposed power stops at the first jump instead of being pushed to
+        # the last dressed-looking point of the bimodal region.
+        self.assertLessEqual(transition["dressed_power_limit_dbm"], -33.0)
+        self.assertGreaterEqual(transition["dressed_power_limit_dbm"], -36.0)
+
+    def test_02c_rejects_when_frequencies_stay_inseparable(self) -> None:
+        power = np.linspace(-50.0, -10.0, 41)
+        frequency = np.linspace(-10_000_000.0, 10_000_000.0, 201)
+        # Dressed and bare differ by less than the required separation.
+        tracked = np.where(power <= -30.0, 1_000_000.0, 1_000_150.0)
+        dataset = xr.Dataset(
+            {"rr_min_response": (("qubit", "power_dbm"), tracked[None, :])},
+            coords={
+                "qubit": ["q1"],
+                "power_dbm": power,
+                "freq": frequency,
+            },
+        )
+        transition = analyze_02c_transitions(dataset)["qubits"]["q1"]
+        self.assertTrue(
+            any(
+                "not distinct" in reason
+                for reason in transition["validation_failures"]
             )
         )
 

@@ -1,8 +1,6 @@
 param(
     [Parameter(Mandatory = $false)]
-    [string]$Python = $env:JY_QUALIBRATE_PYTHON,
-    [Parameter(Mandatory = $false)]
-    [string]$QualibrateConfig = $env:QUALIBRATE_CONFIG_FILE
+    [string]$Python = $env:JY_QUALIBRATE_PYTHON
 )
 
 $ErrorActionPreference = "Stop"
@@ -47,9 +45,8 @@ if (Test-Path -LiteralPath $BootstrapPath -PathType Leaf) {
     }
 }
 $Environment = Resolve-JyEnvironment `
-    $AgentRoot $Python $QualibrateConfig $Existing
+    $AgentRoot $Python $Existing
 $Python = [string]$Environment.python
-$ResolvedQualibrateConfig = [string]$Environment.qualibrate_config
 
 $RequiredProjectFiles = @(
     "AGENTS.md",
@@ -97,7 +94,6 @@ if ($LASTEXITCODE -ne 0) {
 
 $env:PYTHONPATH = Join-Path $AgentRoot "src"
 $env:JY_QUALIBRATE_PYTHON = $Python
-$env:QUALIBRATE_CONFIG_FILE = $ResolvedQualibrateConfig
 & $Python -c "import qualibrate,mcp,yaml,jy_agent"
 if ($LASTEXITCODE -ne 0) {
     exit $LASTEXITCODE
@@ -119,7 +115,6 @@ if ($InitExitCode -eq 0) {
     }
     $Bootstrap = [ordered]@{
         python = (Resolve-Path -LiteralPath $Python).Path
-        qualibrate_config = $ResolvedQualibrateConfig
         remote_provider = if ([string]$Existing.remote_provider -in @("local", "public")) { [string]$Existing.remote_provider } else { "public" }
         public_base_url = [string]$Existing.public_base_url
         approval_access_token_path = [string]$Existing.approval_access_token_path

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import hmac
 import json
 import os
 import signal
@@ -68,7 +70,6 @@ class ExperimentRunner:
             "data_root": str(self.settings.data_root),
             "active_state": str(self.settings.active_state),
             "wiring_path": str(self.settings.wiring_path),
-            "qualibrate_config_path": str(self.settings.qualibrate_config_path),
             "database_path": str(self.settings.database_path),
             "lock_path": str(self.settings.lock_path),
             "state_updates_path": str(state_updates_path),
@@ -130,9 +131,6 @@ class ExperimentRunner:
             if environment.get("PYTHONPATH"):
                 python_paths.append(environment["PYTHONPATH"])
             environment["PYTHONPATH"] = os.pathsep.join(python_paths)
-            environment["QUALIBRATE_CONFIG_FILE"] = str(
-                self.settings.qualibrate_config_path
-            )
             creation_flags = (
                 subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0
             )
@@ -173,6 +171,7 @@ class ExperimentRunner:
             run_id=run_id,
             workflow_id=proposal["workflow_id"],
             exit_receipt_path=exit_receipt_path,
+            process_token=process_token,
         )
         return {
             "run_id": run_id,
@@ -276,6 +275,10 @@ class ExperimentRunner:
     def exit_evidence(self, run_id: str) -> dict[str, Any]:
         """Return authenticated stop/exit evidence without exposing worker secrets."""
         evidence: dict[str, Any] = {}
+        run = self.db.one(
+            "SELECT process_token FROM runs WHERE id = ?",
+            (run_id,),
+        )
         for label, suffix in (("stop_request", ".stop.json"), ("exit_receipt", ".exit.json")):
             path = self.settings.runtime / "requests" / f"{run_id}{suffix}"
             try:
@@ -284,6 +287,14 @@ class ExperimentRunner:
                 continue
             if isinstance(payload, dict) and payload.get("run_id") == run_id:
                 payload.pop("process_token", None)
+                if label == "exit_receipt":
+                    payload["worker_receipt_verified"] = bool(
+                        run
+                        and _verify_worker_exit_receipt(
+                            payload,
+                            str(run.get("process_token") or ""),
+                        )
+                    )
                 evidence[label] = payload
         return evidence
 
@@ -294,6 +305,7 @@ class ExperimentRunner:
         run_id: str,
         workflow_id: str,
         exit_receipt_path: Path,
+        process_token: str,
     ) -> None:
         """Keep the Popen handle so Windows exit codes remain observable."""
 
@@ -305,17 +317,33 @@ class ExperimentRunner:
                     receipt = {"run_id": run_id}
             except (FileNotFoundError, json.JSONDecodeError, OSError):
                 receipt = {"run_id": run_id}
-            receipt.pop("process_token", None)
+            receipt_verified = _verify_worker_exit_receipt(
+                receipt,
+                process_token,
+            )
+            receipt["worker_receipt_verified"] = receipt_verified
             receipt["os_exit_code"] = exit_code
             receipt["observed_at"] = utc_now()
             atomic_write_json(exit_receipt_path, receipt)
-            termination_cause = str(
-                receipt.get("termination_cause")
-                or ("normal_exit" if exit_code == 0 else "process_exit")
+            current = self.db.one(
+                "SELECT termination_cause FROM runs WHERE id = ?",
+                (run_id,),
             )
+            recorded_cause = str(
+                current.get("termination_cause") if current else ""
+            )
+            if recorded_cause == "forced_after_grace":
+                termination_cause = recorded_cause
+            elif receipt_verified:
+                termination_cause = str(
+                    receipt.get("termination_cause")
+                    or ("normal_exit" if exit_code == 0 else "process_exit")
+                )
+            else:
+                termination_cause = "unverified_process_exit"
             self.db.execute(
                 "UPDATE runs SET exit_code = ?, exit_receipt_path = ?, "
-                "termination_cause = COALESCE(termination_cause, ?) WHERE id = ?",
+                "termination_cause = ? WHERE id = ?",
                 (exit_code, str(exit_receipt_path), termination_cause, run_id),
             )
             self.db.event(
@@ -325,6 +353,7 @@ class ExperimentRunner:
                     "run_id": run_id,
                     "exit_code": exit_code,
                     "termination_cause": termination_cause,
+                    "worker_receipt_verified": receipt_verified,
                 },
                 workflow_id,
             )
@@ -451,3 +480,29 @@ def release_worker_lock(lock_path: Path, run_id: str) -> None:
         return
     if payload.get("run_id") == run_id:
         lock_path.unlink(missing_ok=True)
+
+
+def _verify_worker_exit_receipt(
+    receipt: dict[str, Any],
+    process_token: str,
+) -> bool:
+    signature = str(receipt.get("worker_signature") or "")
+    if not process_token or len(signature) != 64:
+        return False
+    unsigned = dict(receipt)
+    unsigned.pop("worker_signature", None)
+    unsigned.pop("worker_receipt_verified", None)
+    unsigned.pop("os_exit_code", None)
+    unsigned.pop("observed_at", None)
+    canonical = json.dumps(
+        unsigned,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    expected = hmac.new(
+        process_token.encode("utf-8"),
+        canonical,
+        hashlib.sha256,
+    ).hexdigest()
+    return hmac.compare_digest(signature, expected)

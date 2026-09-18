@@ -34,8 +34,8 @@ from test_core import SUPERCONDUCTING_ROOT
 
 FULL_SEQUENCE = (
     "02x",
-    "02a",
     "02c",
+    "02a",
     "03a",
     "04",
     "05",

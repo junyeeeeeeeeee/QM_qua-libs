@@ -84,6 +84,10 @@ the desktop conversation; the phone never connects directly to instruments.
 進入 JY 量測模式
 ```
 
+不必再附加 `target:` 或 `multiplex:`。新 workflow 的 qubit 清單來自
+`state.json` 的 `active_qubit_names`，`multiplexed` 預設為 true。若要量不同
+qubit，請先改 `active_qubit_names`，不要在對話裡重寫一份 target 清單。
+
 空格可省略為 `進入JY量測模式`；自動模式同樣可輸入
 `進入JY自動量測模式`。英文指令分別是 `Enter JY measurement mode` 與
 `Enter JY automatic measurement mode`；完整中英文指令表請見
@@ -105,7 +109,9 @@ Codex 支援 durable `/goal` 時，進入自動模式會建立一個只屬於該
 該 turn。Claude/Cursor 沒有由本 repo 強制保持無限 turn 的通用 API，因此會盡量
 維持當前 agent run；若 host 暫停，Dashboard 會提示回對話輸入 `已核准` 續跑。
 
-Enter either exact phrase in a project-loaded conversation. Conversational mode
+Enter either exact phrase in a project-loaded conversation. Do not append
+`target:` or `multiplex:`; a new workflow uses `state.json` `active_qubit_names`
+and defaults `multiplexed=true`. Conversational mode
 requires approval for every run or state change. Automatic mode requests one
 eight-hour bounded authorization and then continues only inside its targets,
 nodes, safe parameters, and 20-attempt-per-node/qubit limit.
@@ -118,12 +124,12 @@ Sol follow the same goal/turn lifecycle. Completion, operator stop, lease expiry
 and hard stops are terminal. Repository instructions cannot guarantee an
 indefinite Claude/Cursor turn, so `已核准` remains the host-resume fallback.
 
-預設校正順序包含 `06 → 06b`。所有 reset 預設為 thermal；只有 active-reset
+預設校正順序為 `02x → 02c → 02a`，並包含 `06 → 06b`。所有 reset 預設為 thermal；只有 active-reset
 07b 得到緊實雙雲團且 fidelity 至少 85% 的 qubit，後續才可選 active。若統計節點
 採 active，會先以 active 複驗 05、06、06b；之後 05st 與 06st 各執行一次，不會
 再逐條 fitting 100 個 iteration。
 
-The default calibration sequence includes `06 → 06b`. Reset defaults to thermal.
+The default calibration sequence is `02x → 02c → 02a`, and includes `06 → 06b`. Reset defaults to thermal.
 Downstream active reset is allowed per qubit only after an active-reset 07b result
 has compact dual clouds and at least 85% fidelity. Active-reset statistics first
 revalidate 05, 06, and 06b under active reset; each statistics node then runs once
@@ -146,13 +152,15 @@ cannot break the MCP initialize response.
 ## Dashboard
 
 進入語句觸發的 Ensure 只把 MCP HTTP service 綁在 `127.0.0.1:8765`，並把
-review-only Dashboard 透過 Cloudflare HTTPS quick tunnel 公開。初次 URL 的一次性
-bootstrap code 只為第一台瀏覽器換取獨立 secure cookie；master access secret 不會
-出現在網址。公開頁面不能呼叫 MCP 或任意執行程式。
+review-only Dashboard 透過 Cloudflare HTTPS quick tunnel 公開。Cloudflare 裸 URL
+不帶任何 token；所有電腦與手機直接開啟同一網址，輸入
+`runtime/dashboard-password.txt` 的固定密碼後取得 secure cookie。此密碼首次
+正常啟動時產生一次並固定沿用，不會 commit 或寫入網址。公開頁面不能呼叫 MCP
+或任意執行程式。
 
 每次進入模式只對使用者顯示 entry result 最外層的 `browser_url`；這是手機與電腦
-共用的 `/` 首頁入口。首頁會解析目前 session，並提供三個分頁：首頁（狀態、裝置
-配對、完整關機）、核准、結果與控制。舊 `/approve/...`、`/autonomy/...` 與
+共用的 `/` 首頁入口。首頁會解析目前 session，並提供三個分頁：首頁（狀態與
+完整關機）、核准、結果與控制。舊 `/approve/...`、`/autonomy/...` 與
 `/session/...` 連結只會導向對應的新分頁，不會建立另一個網站。直接建立或替換
 lease 也會重新綁定同一個 workflow session。
 
@@ -162,14 +170,17 @@ lease 也會重新綁定同一個 workflow session。
 （保留網站）與緊急停止 worker（保留網站）；只有首頁提供完整關機，且需輸入
 `SHUTDOWN <session-id>` 防止誤觸。
 
-手機或第二個瀏覽器請勿重播桌面已用過的初次 URL。在量測電腦開啟
-`http://127.0.0.1:8765/operator`，為每台裝置建立 10 分鐘一次性配對連結；各裝置
-取得不同、可個別撤銷的 12 小時 cookie。本機頁也提供 retained hardware lock 的
-正式檢查／recovery，但仍要求現場實體確認與完整確認句，且不會經 public tunnel。
+手機或第二個瀏覽器直接使用同一裸 URL 與固定密碼，不再需要配對連結；每個瀏覽器
+仍取得各自 12 小時 cookie。本機 `http://127.0.0.1:8765/operator` 只提供
+retained hardware lock 的正式檢查／recovery，仍要求現場實體確認與完整確認句，
+且不會經 public tunnel。本機 Dashboard 是 `http://127.0.0.1:8766/`；Cloudflare
+quick-tunnel hostname 在建立新 tunnel 後可能改變，以當次 entry 回傳的網址為準。
 
 The MCP remains loopback-only at `127.0.0.1:8765`. Only the review Dashboard is
-forwarded through a token-protected Cloudflare HTTPS quick tunnel. The public
-surface cannot invoke MCP or arbitrary code. Agents show only the entry result's
+forwarded through a password-protected Cloudflare HTTPS quick tunnel. The bare
+URL contains no secret; every browser enters the fixed ignored runtime password
+and receives an independent 12-hour secure cookie. The public surface cannot
+invoke MCP or arbitrary code. Agents show only the entry result's
 top-level `browser_url`, a common `/` entry for phones and computers. It resolves
 the active session and links to Home, Approval, and Results & controls. Legacy
 approval, autonomy, and session URLs redirect to the appropriate view. The
@@ -180,9 +191,9 @@ Pause, Resume, End automation (keep site), and Emergency-stop worker (keep site)
 Only Home provides full shutdown, guarded by the exact
 `SHUTDOWN <session-id>` confirmation. Direct or replacement lease requests also
 rebind the workflow's stable session to the current lease.
-Phones and secondary browsers use separate ten-minute pairing links created at
-the lab PC's loopback-only `/operator` page. That page also provides formal
-retained-lock inspection/recovery with physical attestation and is never tunneled.
+Phones and secondary browsers use the same URL and password; no pairing link is
+required. The loopback-only `/operator` page provides formal retained-lock
+inspection/recovery with physical attestation and is never tunneled.
 
 離開或停止語句（例如 `結束量測`、`停止量測`、`退出 JY 量測模式`）會先安全
 終止／等待 active run，再關閉 workflow、Dashboard、MCP HTTP service 與 tunnel。
@@ -207,10 +218,12 @@ so an abrupt exit cannot make formal recovery evidence impossible. Legacy locks
 use the compatibility path only when active, configured, and protected-backup
 state hashes are identical. Never delete a lock manually.
 
-若 QOP/OPX 或儀器無法連線，worker 會把錯誤分類為「儀器無法連線」，暫停本次
-實驗與後續排程，Dashboard 直接顯示檢查與恢復方式；可證明連線根本未建立且 state
-已恢復時會自動釋放本次 lock。若在硬體執行中失聯而無法證明 safe state，lock 僅
-留在本機 safety quarantine，但完整關機仍會關閉網站、MCP 與 tunnel。
+若 QOP/OPX 或儀器無法連線，worker 會暫停本次實驗與後續排程，Dashboard 直接顯示
+檢查與恢復方式。可證明連線未建立，或硬體執行中仍能找到 active node、成功 stop，
+且 state 已回復時，會自動釋放本次 lock 並保留網站；現場確認後輸入
+`恢復量測`，同一 workflow/session 會恢復，目前 node 以新 run-id 從頭執行。
+若 worker 被強制關閉、active node 無法證明停止或 state 回復失敗，lock 留在本機
+safety quarantine；完整關機仍會關閉網站、MCP 與 tunnel。
 
 AI App 或網路斷線時，Dashboard 的暫停、停止與完整關機仍可獨立使用。網路恢復後
 可輸入 `結束量測`／`End measurement` 確認收尾。若下次進入因殘留 process、workflow
@@ -220,8 +233,11 @@ AI App 或網路斷線時，Dashboard 的暫停、停止與完整關機仍可獨
 If QOP/OPX or an instrument cannot be reached, JY classifies the outage and
 pauses the run and new scheduling; the Dashboard shows the recovery steps. A
 provable no-connect failure releases its lock after state restoration. A
-mid-execution disconnect keeps only a local safety quarantine, while full
-shutdown still closes the site, MCP service, and tunnel. If the AI app or network
+mid-execution disconnect also releases only when the recorded active node stops
+successfully and state restoration verifies; otherwise it remains in local
+quarantine. After inspection, `Resume measurement` restores the same session and
+restarts the current node as a new run. Full shutdown still closes the site, MCP
+service, and tunnel. If the AI app or network
 disconnects, Dashboard controls remain usable. After reconnection, use `End
 measurement`; if a later entry is blocked by stale state, use `Recover`.
 

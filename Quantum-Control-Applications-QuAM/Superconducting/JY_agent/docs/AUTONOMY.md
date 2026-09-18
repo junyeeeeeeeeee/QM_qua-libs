@@ -49,15 +49,15 @@ lock remains after every worker is verified dead, the lock is quarantined (not
 deleted) while services still close. The next Ensure starts loopback
 recovery-only service for the on-site operator.
 
-`02x` 與 `02a` 是 fixed multiplex nodes。在完整 targets 的 bounded lease 中，
-即使 Decision 只指出某一個 qubit 需要 retry，server 也會把該次 run 的 `qubits`
-正規化為完整 workflow targets；只涵蓋子群的 lease 會在接觸硬體前被拒絕，而且
-不會把既有 lease 誤標成 halted。
+每個 calibration node 的第一次 run 必須用同一組參數 multiplex 全部 active
+targets。分析後已通過的 qubit 要排除；未通過的再成組改參數重測。誤把已通過目標
+排進 retry 是 recoverable planning error：server 拒絕請求但不 hard-stop lease。
 
-`02x` and `02a` are fixed multiplex nodes. Under a full-target bounded lease,
-a target-local retry decision is normalized to the complete workflow target set.
-A subgroup-only lease is rejected before hardware access without falsely halting
-an otherwise valid lease.
+The first run of every calibration node must multiplex every active target with
+the same parameters. After analysis, omit already-resolved qubits and retry only
+unresolved subgroups with modified parameters. Re-including resolved targets is
+a recoverable planning error: the server rejects the request without hard-stopping
+the lease.
 
 完整限制以 [rules/policies.yaml](../rules/policies.yaml) 為準，科學流程以
 [rules/PLAYBOOK.md](../rules/PLAYBOOK.md) 為準。

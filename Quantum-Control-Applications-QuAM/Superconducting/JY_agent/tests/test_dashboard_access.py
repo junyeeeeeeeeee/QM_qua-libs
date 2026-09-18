@@ -58,7 +58,7 @@ class DashboardAccessTests(unittest.TestCase):
             self.assertIsNone(new_access.validate_device(device["token"]))
             self.assertEqual(old_access.validate_device(device["token"])["id"], device["id"])
 
-    def test_desktop_and_phone_receive_independent_revocable_cookies(self) -> None:
+    def test_password_logins_receive_independent_revocable_cookies(self) -> None:
         with tempfile.TemporaryDirectory() as folder:
             settings = replace(
                 make_settings(Path(folder), sample_state(0.2, 0.1)),
@@ -68,18 +68,9 @@ class DashboardAccessTests(unittest.TestCase):
             )
             settings.validate_approval_transport()
             settings.runtime.mkdir(parents=True, exist_ok=True)
-            bootstrap_code = "b" * 64
-            (settings.runtime / "public-dashboard-bootstrap.json").write_text(
-                json.dumps(
-                    {
-                        "code_sha256": hashlib.sha256(
-                            bootstrap_code.encode("utf-8")
-                        ).hexdigest(),
-                        "expires_at": "2999-01-01T00:00:00+00:00",
-                        "used": False,
-                    }
-                ),
-                encoding="utf-8",
+            password = "shared-lab-password"
+            (settings.runtime / "dashboard-password.txt").write_text(
+                password, encoding="utf-8"
             )
             app = create_approval_app(settings)
             access = DashboardAccessManager(
@@ -91,8 +82,9 @@ class DashboardAccessTests(unittest.TestCase):
             ) as desktop, TestClient(
                 app, base_url="https://jy-public.example.com"
             ) as phone:
-                admitted = desktop.get(
-                    f"/healthz?bootstrap_code={bootstrap_code}",
+                admitted = desktop.post(
+                    "/login",
+                    data={"password": password, "next": "/healthz"},
                     follow_redirects=False,
                 )
                 self.assertEqual(admitted.status_code, 303)
@@ -103,24 +95,23 @@ class DashboardAccessTests(unittest.TestCase):
                     hashlib.sha256(settings.approval_access_token.encode()).hexdigest(),
                 )
 
-                pairing = access.create_pairing("Phone", "local operator")
-                paired = phone.get(
-                    f"/device-pair?pairing_code={pairing['code']}",
+                paired = phone.post(
+                    "/login",
+                    data={"password": password, "next": "/healthz"},
                     follow_redirects=False,
                 )
                 self.assertEqual(paired.status_code, 303)
-                self.assertNotIn("pairing_code", paired.headers["location"])
+                self.assertEqual(paired.headers["location"], "/healthz")
                 phone_cookie = phone.cookies.get("jy_dashboard_access")
                 self.assertTrue(phone_cookie)
                 self.assertNotEqual(phone_cookie, desktop_cookie)
                 self.assertEqual(desktop.get("/healthz").status_code, 200)
                 self.assertEqual(phone.get("/healthz").status_code, 200)
 
-                phone_record = next(
-                    item for item in access.list_devices() if item["label"] == "Phone"
-                )
+                phone_record = access.validate_device(phone_cookie)
                 access.revoke_device(phone_record["id"], actor="local operator")
-                self.assertEqual(phone.get("/healthz").status_code, 403)
+                refused = phone.get("/healthz", follow_redirects=False)
+                self.assertEqual(refused.status_code, 303)
                 self.assertEqual(desktop.get("/healthz").status_code, 200)
 
 

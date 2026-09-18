@@ -5,13 +5,12 @@ import hmac
 import ipaddress
 import json
 from html import escape
-from typing import Any
-from urllib.parse import parse_qs, urlencode
+from urllib.parse import parse_qs
 
 from starlette.requests import Request
 from starlette.responses import HTMLResponse, Response
 
-from .dashboard_access import DashboardAccessError, DashboardAccessManager
+from .dashboard_access import DashboardAccessManager
 from .recovery import HardwareLockRecovery, HardwareLockRecoveryError
 from .service import AgentService, ServiceError
 
@@ -46,7 +45,6 @@ async def handle_operator_console(
             headers=OPERATOR_SECURITY_HEADERS,
         )
 
-    pairing_link: str | None = None
     success: str | None = None
     error: str | None = None
     if request.method == "POST":
@@ -69,24 +67,7 @@ async def handle_operator_console(
                 raise ServiceError("The operator-console token was invalid")
             operation = _single(fields, "operation")
             actor = f"{getpass.getuser()} via local operator console"
-            if operation == "create_pairing":
-                if service.approval_transport != "public":
-                    raise ServiceError("Public Dashboard access is not currently enabled")
-                pairing = access.create_pairing(
-                    _single(fields, "label"), actor, ttl_minutes=10
-                )
-                pairing_link = (
-                    f"{service.browser_approval_origin}/device-pair?"
-                    + urlencode({"pairing_code": pairing["code"]})
-                )
-                success = (
-                    "A one-time device link was created. Open it on the intended "
-                    "phone/browser within ten minutes."
-                )
-            elif operation == "revoke_device":
-                result = access.revoke_device(_single(fields, "device_id"), actor=actor)
-                success = f"Device access is {result['status']}."
-            elif operation == "recover_lock":
+            if operation == "recover_lock":
                 if _single(fields, "hardware_attestation") != "confirmed":
                     raise HardwareLockRecoveryError(
                         "Confirm that the connected hardware has no active job/output."
@@ -109,14 +90,12 @@ async def handle_operator_console(
             UnicodeDecodeError,
             ValueError,
             ServiceError,
-            DashboardAccessError,
             HardwareLockRecoveryError,
         ) as exc:
             error = str(exc)
     return _page(
         service,
         access,
-        pairing_link=pairing_link,
         success=success,
         error=error,
         status_code=400 if error else 200,
@@ -127,7 +106,6 @@ def _page(
     service: AgentService,
     access: DashboardAccessManager,
     *,
-    pairing_link: str | None = None,
     success: str | None = None,
     error: str | None = None,
     status_code: int = 200,
@@ -138,29 +116,6 @@ def _page(
         notice = f'<p class="notice error">{escape(error)}</p>'
     elif success:
         notice = f'<p class="notice success">{escape(success)}</p>'
-
-    pairing_result = ""
-    if pairing_link:
-        pairing_result = f"""
-        <section class="card highlight"><h2>New device pairing link</h2>
-          <p>This link is single-use and expires in ten minutes. Send it only to the intended device.</p>
-          <code>{escape(pairing_link)}</code>
-        </section>"""
-
-    devices = access.list_devices()
-    device_rows = "".join(
-        f"""<tr><td>{escape(str(item['label']))}</td><td>{escape(str(item['status']))}</td>
-        <td>{escape(str(item.get('last_seen_at') or 'never'))}</td><td>{escape(str(item['expires_at']))}</td>
-        <td>{_revoke_form(item, csrf) if item['status'] == 'active' else ''}</td></tr>"""
-        for item in devices
-    ) or '<tr><td colspan="5">No device has been paired for this service instance.</td></tr>'
-
-    pairings = access.list_pairings()
-    pairing_rows = "".join(
-        f"<tr><td>{escape(str(item['label']))}</td><td>{escape(str(item['status']))}</td>"
-        f"<td>{escape(str(item['expires_at']))}</td></tr>"
-        for item in pairings
-    ) or '<tr><td colspan="3">No recent pairing codes.</td></tr>'
 
     recovery_html = _recovery_section(service, csrf)
     status = service.status()
@@ -184,26 +139,13 @@ table{{width:100%;border-collapse:collapse}}th,td{{padding:9px;border-bottom:1px
 {notice}
 <section class="card"><h2>Current state</h2><p>Workflow: {escape(str(workflow.get('id') or 'none'))}</p>
 <p>Workflow status: {escape(str(workflow.get('status') or 'none'))}; active worker: {escape(str(bool(status.get('active_run'))))}; hardware lock: {escape(str(bool(status.get('hardware_lock'))))}</p></section>
-{pairing_result}
-<section class="card"><h2>Pair another phone or browser</h2>
-<p>Create one separate, short-lived link per device. The long-lived service secret is never placed in the URL.</p>
-<form method="post" action="/operator"><input type="hidden" name="operation" value="create_pairing">
-<input type="hidden" name="csrf_token" value="{escape(csrf)}"><label>Device label
-<input name="label" maxlength="80" placeholder="e.g. Richard's phone" required></label>
-<button type="submit">Create 10-minute pairing link</button></form></section>
-<section class="card"><h2>Paired devices</h2><div class="scroll"><table><thead><tr><th>Label</th><th>Status</th><th>Last seen</th><th>Expires</th><th>Action</th></tr></thead><tbody>{device_rows}</tbody></table></div></section>
-<section class="card"><h2>Recent pairing codes</h2><div class="scroll"><table><thead><tr><th>Label</th><th>Status</th><th>Expires</th></tr></thead><tbody>{pairing_rows}</tbody></table></div></section>
+<section class="card"><h2>Public Dashboard access</h2>
+<p>Phones and browsers open the same Cloudflare URL and sign in with the fixed
+password stored at <code>{escape(str(service.settings.runtime / 'dashboard-password.txt'))}</code>.
+There is no device-pairing step.</p></section>
 {recovery_html}
 </main></body></html>"""
     return HTMLResponse(html, status_code=status_code, headers=OPERATOR_SECURITY_HEADERS)
-
-
-def _revoke_form(item: dict[str, Any], csrf: str) -> str:
-    return f"""<form method="post" action="/operator">
-    <input type="hidden" name="operation" value="revoke_device">
-    <input type="hidden" name="csrf_token" value="{escape(csrf)}">
-    <input type="hidden" name="device_id" value="{escape(str(item['id']))}">
-    <button type="submit" class="danger">Revoke</button></form>"""
 
 
 def _recovery_section(service: AgentService, csrf: str) -> str:

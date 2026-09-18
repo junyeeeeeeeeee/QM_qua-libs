@@ -1,37 +1,7 @@
-function Resolve-JyQualibrateConfig(
-    [string]$AgentRoot,
-    [string]$Override,
-    $Saved
-) {
-    $Candidates = @(
-        $Override,
-        $env:QUALIBRATE_CONFIG_FILE,
-        $(if ($null -ne $Saved) { [string]$Saved.qualibrate_config } else { "" }),
-        $(Join-Path $env:USERPROFILE ".qualibrate\config.toml")
-    )
-    foreach ($CandidateValue in $Candidates) {
-        if ([string]::IsNullOrWhiteSpace([string]$CandidateValue)) {
-            continue
-        }
-        $Candidate = [string]$CandidateValue
-        if (Test-Path -LiteralPath $Candidate -PathType Container) {
-            $Candidate = Join-Path $Candidate "config.toml"
-        }
-        if (Test-Path -LiteralPath $Candidate -PathType Leaf) {
-            return (Resolve-Path -LiteralPath $Candidate).Path
-        }
-    }
-    throw (
-        "Qualibrate config.toml was not found. Pass -QualibrateConfig once or " +
-        "set QUALIBRATE_CONFIG_FILE; the resolved path is persisted for later launches."
-    )
-}
-
 function Resolve-JyPython(
     [string]$AgentRoot,
     [string]$Override,
     $Saved,
-    [string]$QualibrateConfig,
     [switch]$RequireAgent
 ) {
     $Candidates = @(
@@ -46,10 +16,8 @@ function Resolve-JyPython(
         $Candidates += $PathPython.Source
     }
     $PreviousPythonPath = $env:PYTHONPATH
-    $PreviousConfig = $env:QUALIBRATE_CONFIG_FILE
     try {
         $env:PYTHONPATH = Join-Path $AgentRoot "src"
-        $env:QUALIBRATE_CONFIG_FILE = $QualibrateConfig
         foreach ($CandidateValue in ($Candidates | Select-Object -Unique)) {
             if ([string]::IsNullOrWhiteSpace([string]$CandidateValue) -or
                 -not (Test-Path -LiteralPath ([string]$CandidateValue) -PathType Leaf)) {
@@ -70,30 +38,25 @@ function Resolve-JyPython(
     }
     finally {
         $env:PYTHONPATH = $PreviousPythonPath
-        $env:QUALIBRATE_CONFIG_FILE = $PreviousConfig
     }
     $Requirement = if ($RequireAgent) { "Qualibrate and JY_agent dependencies" } else { "Qualibrate" }
     throw (
         "No Python candidate could import $Requirement. Run repository-root " +
-        "jy_agent.ps1 -Action Install with -Python and -QualibrateConfig."
+        "jy_agent.ps1 -Action Install with -Python."
     )
 }
 
 function Resolve-JyEnvironment(
     [string]$AgentRoot,
     [string]$Python,
-    [string]$QualibrateConfig,
     $Saved,
     [switch]$RequireAgent
 ) {
-    $ResolvedConfig = Resolve-JyQualibrateConfig $AgentRoot $QualibrateConfig $Saved
     $ResolvedPython = Resolve-JyPython `
-        $AgentRoot $Python $Saved $ResolvedConfig -RequireAgent:$RequireAgent
+        $AgentRoot $Python $Saved -RequireAgent:$RequireAgent
     $env:PYTHONPATH = Join-Path $AgentRoot "src"
     $env:JY_QUALIBRATE_PYTHON = $ResolvedPython
-    $env:QUALIBRATE_CONFIG_FILE = $ResolvedConfig
     return [ordered]@{
         python = $ResolvedPython
-        qualibrate_config = $ResolvedConfig
     }
 }

@@ -1,5 +1,44 @@
 # Update log / 更新紀錄
 
+## 2026-09-06
+
+- 取消 `02x`/`02a` fixed full-batch retry：與其他節點相同，第一次全目標 multiplex，
+  之後只重測 unresolved 子群。誤排已通過目標改為 soft-reject，不再 hard-stop lease。
+- Removed fixed full-batch retries for `02x`/`02a`. Every node now follows
+  first-batch-all-targets then unresolved-subgroup retries. Re-including
+  resolved targets is rejected without halting the autonomy lease.
+
+## 2026-09-04
+
+- 所有節點改為 02x 式 multiplex-first：第一次 run 必須用同一組參數量測全部
+  active targets。只有部分 qubit 失敗時，才把那些未通過的 qubit 成組改參數
+  重測；不可一開始就逐顆孤立量測。`02c`/`04`/`05`/`07b`/`06`/`06b`/`10a`
+  由 server 強制第一輪全顆 multiplex。
+- All nodes now follow the 02x multiplex-first schedule. The first run must
+  measure every active target with one shared parameter set. Retries may omit
+  resolved qubits, but unresolved qubits that can share a parameter change are
+  grouped. Sequential isolated one-qubit starts are no longer the default.
+
+## 2026-09-02
+
+- Resonator 策略改為：操作者先把足夠正確的 resonator RF 寫入 `state.json`；
+  `02x`/`02c`/`02a` 只做數 MHz 級微調。`frequency_span_in_mhz` 上限 60 MHz，
+  且掃描窗口不可包含 readout `upconverter_frequency`，因為原始 fitting 會把
+  LO（IF=0）誤認為共振。預設順序改為 `02x → 02c → 02a → …`；`02a` 只做
+  dressed frequency 小範圍掃描。
+- Resonator strategy: operator-supplied RF in `state.json` is already close.
+  `02x`/`02c`/`02a` only fine-tune a few MHz, cap span at 60 MHz, and reject
+  windows that include the readout upconverter. Sequence is now
+  `02x → 02c → 02a → …`; `02a` is a simple dressed-frequency scan.
+
+- 進入語句不必再寫 `target:` 或 `multiplex:`。新 workflow 從 `state.json` 的
+  `active_qubit_names` 取 targets，`multiplexed` 預設為 true；明確覆寫仍可用。
+  既有非 multiplex workflow 以 phrase-only 恢復時，不會被預設值改成 multiplex。
+- Phrase-only entry no longer requires chat-side `target` or `multiplex`. New
+  workflows use `state.json` `active_qubit_names` and default `multiplexed=true`.
+  Resuming a non-multiplexed workflow with an omitted multiplexed flag keeps it
+  unchanged.
+
 ## 2026-08-29
 
 - 修正完整關機順序：先寫 SQLite 與

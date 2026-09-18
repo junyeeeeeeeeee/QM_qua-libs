@@ -39,8 +39,11 @@ enforces target/node scope, an eight-hour expiry, twenty attempts per node/qubit
 pass-backed state commits, and hard-stop conditions. Low confidence and
 manual_review do not halt the lease, but they do not bypass evidence requirements.
 Recognized instrument-connectivity failures pause the experiment and scheduling
-instead of becoming a generic crash; wait for the operator to repair connectivity
-and resume. If entry fails because stale JY lifecycle state remains, instruct the
+instead of becoming a generic crash. Preserve the same workflow/session, wait for
+the operator to repair connectivity, then use jy_resume_measurement_mode with one
+of {list(settings.measurement_resume_phrases)!r}. The interrupted Python call is
+not continued mid-stack; the current node is run again as a new run. If entry
+fails because stale JY lifecycle state remains, instruct the
 operator to issue `恢復` or `Recover`; the repository-root lifecycle wrapper handles
 that recovery outside MCP and never auto-deletes a retained hardware lock.
 Any configured exit, stop, or shutdown phrase (including
@@ -55,11 +58,24 @@ For every state-changing tool that accepts operation_id, generate one stable UUI
 before the first call and reuse that same operation_id only when retrying the exact
 same request after a client timeout.
 Never modify calibration_graph/ or Script/.
+On either entry phrase, call the matching `jy_enter_*` tool with `client_id` and
+`activation_phrase` only unless the operator explicitly overrides them. Omit
+`targets` and `multiplexed`: a new workflow uses `state.json` `active_qubit_names`
+and defaults `multiplexed=true`. Explicit `targets` or `multiplexed=false` remain
+optional overrides.
 For either mode, surface only the entry result's top-level `browser_url` to the
 operator. Approval and control URL fields are protocol aliases for that same
 session Dashboard and must not be presented as additional websites.
 Keep the final experiment report to result plot(s), Decision, Reason, and Next action
 (next node plus new parameters), with only two or three short sentences.
+When ending a turn while still in measurement mode, copy `operator_handoff.chat`
+verbatim as a three-item markdown list. Do not join the items into one
+paragraph. The operator must see separate lines for (1) 需要使用者做什麼,
+(2) 完成後回傳, and (3) 如需結束量測，請於網頁首頁結束量測後再對話輸入「結束量測」。
+Successful entry shows only the top-level `browser_url`. After the operator
+sends `已核准` / `Approved`, the first line of the next reply is exactly `已核准`.
+A live turn may execute `結束量測` directly; a paused or disconnected turn needs
+Dashboard Home shutdown first, then `結束量測` to verify.
 """.strip()
 
 service = AgentService(settings)
@@ -111,7 +127,7 @@ async def healthz(request: Request) -> Response:
     include_in_schema=False,
 )
 async def operator_console(request: Request) -> Response:
-    """Local-only pairing, shutdown, and retained-lock recovery console."""
+    """Local-only shutdown and retained-lock recovery console."""
     return await handle_operator_console(request, service, dashboard_access)
 
 
@@ -194,36 +210,33 @@ def policies() -> str:
 
 
 @mcp.prompt()
-def begin_jy_bringup(
-    targets: list[str], client_id: str, multiplexed: bool = False
-) -> str:
+def begin_jy_bringup(client_id: str) -> str:
     """Start a policy-gated JY bring-up session."""
     return (
         f"Wait until the user says one of "
         f"{list(settings.measurement_mode_entry_phrases)!r}. Then read jy://playbook and "
         "call jy_enter_measurement_mode with "
-        f"targets={targets!r}, client_id={client_id!r}, and "
-        f"multiplexed={multiplexed!r}. Preserve and show the returned session "
-        "browser URL. Call jy_list_experiments, then discuss and propose one "
-        "experiment at a time; each run/state approval appears on that page."
+        f"client_id={client_id!r} only unless the operator explicitly overrides "
+        "targets or multiplexed. A new workflow uses state.json "
+        "active_qubit_names and defaults multiplexed=true. Preserve and show the "
+        "returned session browser URL. Call jy_list_experiments, then discuss and "
+        "propose one experiment at a time; each run/state approval appears on that "
+        "page."
     )
 
 
 @mcp.prompt()
-def begin_jy_autonomy(
-    targets: list[str],
-    client_id: str,
-    multiplexed: bool = False,
-) -> str:
+def begin_jy_autonomy(client_id: str) -> str:
     """Start the bounded automatic bring-up mode."""
     return (
         f"Wait until the user says one of {list(settings.autonomy_mode_entry_phrases)!r}. "
         "Read jy://playbook and jy://policies, then call jy_enter_autonomy_mode "
-        f"for targets={targets!r} and multiplexed={multiplexed!r}. Show its session "
+        f"with client_id={client_id!r} only unless the operator explicitly overrides "
+        "targets or multiplexed. A new workflow uses state.json "
+        "active_qubit_names and defaults multiplexed=true. Show its session "
         "browser URL and wait for the one lease approval with "
         "jy_wait_for_autonomy_status. Use only jy_autonomy_* execution tools within "
-        "scope and wait on new events "
-        f"between actions, and use client_id={client_id!r} for every audit record."
+        "scope and wait on new events between actions."
     )
 
 
@@ -232,10 +245,15 @@ def jy_enter_measurement_mode(
     client_id: str,
     activation_phrase: str,
     targets: list[str] | None = None,
-    multiplexed: bool = False,
+    multiplexed: bool | None = None,
     operation_id: str | None = None,
 ) -> dict[str, Any]:
-    """Enter conversational mode for one human-approved experiment at a time."""
+    """Enter conversational mode for one human-approved experiment at a time.
+
+    Omit targets to use state.json active_qubit_names. Omit multiplexed to
+    default true for a new workflow; omitted multiplexed does not change an
+    existing workflow.
+    """
     request = {
         "client_id": client_id,
         "activation_phrase": activation_phrase,
@@ -257,11 +275,16 @@ def jy_enter_autonomy_mode(
     client_id: str,
     activation_phrase: str,
     targets: list[str] | None = None,
-    multiplexed: bool = False,
+    multiplexed: bool | None = None,
     reason: str = "Operator entered JY autonomous measurement mode.",
     operation_id: str | None = None,
 ) -> dict[str, Any]:
-    """Enter bounded automatic mode and return its one lease approval page."""
+    """Enter bounded automatic mode and return its one lease approval page.
+
+    Omit targets to use state.json active_qubit_names. Omit multiplexed to
+    default true for a new workflow; omitted multiplexed does not change an
+    existing workflow.
+    """
     request = {
         "client_id": client_id,
         "activation_phrase": activation_phrase,
@@ -487,10 +510,11 @@ def jy_start_workflow(
     initial_parameters: dict[str, Any] | None = None,
     operation_id: str | None = None,
 ) -> dict[str, Any]:
-    """Enter measurement mode and create a workflow for explicit qubits.
+    """Create a workflow for explicit qubits. Prefer jy_enter_* for conversation.
 
-    Set initial_parameters to {"multiplexed": true} to require all node runs
-    in this workflow to measure the target set concurrently.
+    Phrase-only jy_enter_* already uses state.json active_qubit_names and
+    defaults multiplexed=true. Set initial_parameters to {"multiplexed": false}
+    only when a non-multiplexed workflow is required.
     """
     request = {
         "targets": targets,
@@ -538,7 +562,7 @@ def jy_resume_measurement_mode(
     activation_phrase: str,
     operation_id: str | None = None,
 ) -> dict[str, Any]:
-    """Re-enter measurement mode and resume a paused workflow."""
+    """Resume the same paused workflow/session after instrument inspection."""
     request = {
         "workflow_id": workflow_id,
         "client_id": client_id,

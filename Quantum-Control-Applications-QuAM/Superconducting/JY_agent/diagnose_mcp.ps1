@@ -1,8 +1,6 @@
 param(
     [Parameter(Mandatory = $false)]
     [string]$Python = $env:JY_QUALIBRATE_PYTHON,
-    [Parameter(Mandatory = $false)]
-    [string]$QualibrateConfig = $env:QUALIBRATE_CONFIG_FILE,
     [int]$TimeoutSeconds = 90
 )
 
@@ -23,7 +21,7 @@ if (Test-Path -LiteralPath $BootstrapPath -PathType Leaf) {
     }
 }
 $Environment = Resolve-JyEnvironment `
-    $AgentRoot $Python $QualibrateConfig $Saved -RequireAgent
+    $AgentRoot $Python $Saved -RequireAgent
 $ResolvedPython = [string]$Environment.python
 
 & $ResolvedPython -m jy_agent doctor `

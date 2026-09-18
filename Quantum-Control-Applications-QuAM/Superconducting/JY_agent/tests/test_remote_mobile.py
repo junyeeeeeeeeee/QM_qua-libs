@@ -15,7 +15,7 @@ REPOSITORY_ROOT = AGENT_ROOT.parents[2]
 
 
 class RemoteMobileTests(unittest.TestCase):
-    def test_idempotent_bootstrap_uses_token_protected_public_tunnel(self) -> None:
+    def test_idempotent_bootstrap_uses_password_protected_public_tunnel(self) -> None:
         script = (AGENT_ROOT / "ensure_server.ps1").read_text(encoding="utf-8")
         self.assertIn('"http://127.0.0.1:$ApprovalPort"', script)
         self.assertIn('"http://127.0.0.1:$McpPort/healthz"', script)
@@ -24,8 +24,12 @@ class RemoteMobileTests(unittest.TestCase):
         self.assertIn("-WindowStyle Hidden", script)
         self.assertIn("JY_APPROVAL_ACCESS_TOKEN", script)
         self.assertIn("public-dashboard-access.token", script)
-        self.assertIn("public-dashboard-bootstrap.json", script)
-        self.assertIn("bootstrap_code=", script)
+        self.assertIn("dashboard-password.txt", script)
+        self.assertIn("Read-OrCreate-DashboardPassword", script)
+        self.assertIn("dashboard_password_path", script)
+        self.assertEqual(script.count("public-dashboard-bootstrap.json"), 1)
+        self.assertIn("legacy bootstrap record", script)
+        self.assertNotIn("bootstrap_code=", script)
         self.assertIn("JY_SERVICE_INSTANCE_NONCE", script)
         self.assertIn("JYAgentLifecycle", script)
         self.assertIn("Refusing to stop an unidentified listener", script)
@@ -92,7 +96,7 @@ class RemoteMobileTests(unittest.TestCase):
         self.assertIn('"Doctor"', launcher)
         self.assertIn('"Recover"', launcher)
         self.assertIn('"recover_closed_state.ps1"', launcher)
-        self.assertIn("QualibrateConfig", launcher)
+        self.assertNotIn("QualibrateConfig", launcher)
 
         claude_path = REPOSITORY_ROOT / ".mcp.json"
         cursor_path = REPOSITORY_ROOT / ".cursor" / "mcp.json"
@@ -163,14 +167,15 @@ class RemoteMobileTests(unittest.TestCase):
         self.assertEqual(completed.returncode, 0, completed.stderr)
         self.assertEqual(Path(completed.stdout.strip()).resolve(), AGENT_ROOT)
 
-    def test_root_launcher_forwards_named_python_parameter_safely(self) -> None:
+    def test_root_launcher_forwards_only_named_python_parameter_safely(self) -> None:
         launcher = (REPOSITORY_ROOT / "jy_agent.ps1").read_text(
             encoding="utf-8"
         )
         self.assertIn(
-            "& $TargetScript -Python $Python -QualibrateConfig $QualibrateConfig",
+            "& $TargetScript -Python $Python",
             launcher,
         )
+        self.assertNotIn("QualibrateConfig", launcher)
         self.assertNotIn("@ForwardedArguments", launcher)
 
     def test_doctor_rejects_relative_codex_paths_for_remote_resume(self) -> None:

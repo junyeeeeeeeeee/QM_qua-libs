@@ -52,6 +52,8 @@
   [Command.md](Command.md) 指令表；stale services/workflow 不再要求使用者手動找 PID。
 - [x] Dashboard 加入 AI App／外部網路中斷時的獨立 pause、stop、full-shutdown 指引。
 
+- [x] 全節點改為首次全目標 multiplex，之後只重測 unresolved 子群（含 02x/02a）；
+  誤排已通過目標 soft-reject，不 hard-stop lease
 - [x] 修正 fixed multiplex `02a` 子群 retry：完整 lease 會正規化為全部 workflow
   targets；窄 lease 在碰硬體前拒絕且不再誤 halt。
 - [x] 公開 Dashboard 改為每裝置獨立 session；本機 operator console 可建立 10 分鐘

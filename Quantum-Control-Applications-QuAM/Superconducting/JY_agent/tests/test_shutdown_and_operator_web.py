@@ -150,6 +150,83 @@ class FullShutdownWebTests(unittest.TestCase):
                 service.autonomy_status(lease_id=lease_id)["status"], "paused"
             )
 
+    def test_results_resume_after_instrument_outage_keeps_active_controls(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            service = AgentService(
+                make_settings(Path(folder), sample_state(0.2, 0.1))
+            )
+            entered = service.enter_autonomy_mode(
+                "unittest-agent", AUTO_PHRASE, ["q1"]
+            )
+            proposal_id = entered["approval"]["id"]
+            lease_id = entered["approval"]["autonomy_lease_id"]
+            session_id = entered["dashboard"]["id"]
+            service._approve_pending_proposal(
+                proposal_id, "unit-test-human", "unit_test"
+            )
+            service.db.execute(
+                "INSERT INTO runs(id, workflow_id, proposal_id, node_id, "
+                "parameters_json, status, analysis_status, analysis_json, "
+                "termination_cause, autonomy_lease_id) VALUES "
+                "('web-instrument-outage', ?, ?, '02x', '{}', 'failed', "
+                "'failed', ?, 'instrument_unreachable', ?)",
+                (
+                    entered["workflow"]["id"],
+                    proposal_id,
+                    json.dumps(
+                        {
+                            "analysis_status": "failed",
+                            "failure_category": "instrument_unreachable",
+                            "hardware_lock_recovery_required": False,
+                            "operator_message": {
+                                "zh-Hant": "儀器連線失敗，本次實驗與後續排程已暫停。",
+                                "en": "Instrument connectivity failed.",
+                            },
+                            "plots": [],
+                        },
+                        ensure_ascii=False,
+                    ),
+                    lease_id,
+                ),
+            )
+            asyncio.run(
+                handle_session_dashboard(
+                    _request(
+                        f"/session/{session_id}/results",
+                        {"session_id": session_id},
+                    ),
+                    service,
+                    view="results",
+                )
+            )
+            form = urlencode(
+                {
+                    "operation": "control",
+                    "action": "resume",
+                    "csrf_token": service.autonomy_csrf_token(lease_id),
+                }
+            ).encode("ascii")
+            page = asyncio.run(
+                handle_session_dashboard(
+                    _request(
+                        f"/session/{session_id}/results",
+                        {"session_id": session_id},
+                        method="POST",
+                        body=form,
+                    ),
+                    service,
+                    view="results",
+                )
+            ).body.decode("utf-8")
+
+            self.assertEqual(
+                service.autonomy_status(lease_id=lease_id)["status"], "active"
+            )
+            self.assertIn("控制已套用：進行中。", page)
+            self.assertIn("目前實驗完成後暫停排程", page)
+            self.assertNotIn("繼續排程", page)
+            self.assertNotIn("儀器錯誤：量測已暫停", page)
+
     def test_full_shutdown_requires_exact_second_confirmation(self) -> None:
         with tempfile.TemporaryDirectory() as folder:
             service = AgentService(
@@ -503,7 +580,7 @@ class FullShutdownWebTests(unittest.TestCase):
 
 
 class LocalOperatorWebTests(unittest.TestCase):
-    def test_operator_console_is_loopback_only_and_creates_one_time_link(self) -> None:
+    def test_operator_console_is_loopback_only_without_pairing_ui(self) -> None:
         with tempfile.TemporaryDirectory() as folder:
             settings = replace(
                 make_settings(Path(folder), sample_state(0.2, 0.1)),
@@ -539,27 +616,20 @@ class LocalOperatorWebTests(unittest.TestCase):
             )
             self.assertEqual(rebound_host.status_code, 403)
 
-            form = urlencode(
-                {
-                    "operation": "create_pairing",
-                    "csrf_token": service.operator_csrf_token(),
-                    "label": "Richard phone",
-                }
-            ).encode("ascii")
             response = asyncio.run(
                 handle_operator_console(
-                    _request(
-                        "/operator", method="POST", body=form, port=8765
-                    ),
+                    _request("/operator", port=8765),
                     service,
                     access,
                 )
             )
             body = response.body.decode("utf-8")
             self.assertEqual(response.status_code, 200)
-            self.assertIn("https://jy-public.example.com/device-pair?pairing_code=", body)
+            self.assertIn("dashboard-password.txt", body)
+            self.assertIn("There is no device-pairing step", body)
+            self.assertNotIn("Pair another phone or browser", body)
+            self.assertNotIn("/device-pair", body)
             self.assertNotIn(settings.approval_access_token, body)
-            self.assertEqual(access.list_pairings()[0]["label"], "Richard phone")
 
     def test_operator_console_performs_formal_lock_recovery(self) -> None:
         with tempfile.TemporaryDirectory() as folder:

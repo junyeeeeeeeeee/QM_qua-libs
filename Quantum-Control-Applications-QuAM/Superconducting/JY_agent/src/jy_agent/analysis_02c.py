@@ -6,18 +6,23 @@ from typing import Any
 from .analysis_02c_absence import assess_bare_only_absence
 
 
-DEFAULT_02C_RULES: dict[str, float | int] = {
+DEFAULT_02C_RULES: dict[str, Any] = {
     "plateau_tail_fraction": 0.20,
     "min_plateau_points": 4,
-    "plateau_min_coverage": 0.70,
+    "plateau_min_coverage": 0.55,
     "min_frequency_separation_steps": 4.0,
-    "plateau_band_steps": 2.0,
-    "plateau_band_fraction_of_separation": 0.15,
-    "max_plateau_width_steps": 4.0,
-    "max_plateau_width_fraction_of_separation": 0.35,
+    "plateau_band_steps": 4.0,
+    "plateau_band_fraction_of_separation": 0.25,
+    "max_plateau_width_steps": 8.0,
+    "max_plateau_width_fraction_of_separation": 0.55,
     "min_depletion_points": 2,
     "min_transition_monotonic_fraction": 0.70,
     "transition_monotonic_slack_fraction": 0.10,
+    "min_classified_plateau_points": 2,
+    "require_plateau_stability": False,
+    "require_plateau_width": False,
+    "require_depletion_points": False,
+    "require_transition_monotonic": False,
     "frequency_edge_fraction": 0.05,
     "selected_power_tolerance_steps": 2.0,
     "smoothing_window_points": 3,
@@ -29,7 +34,7 @@ DEFAULT_02C_RULES: dict[str, float | int] = {
     "bare_only_min_num_averages": 200,
     "bare_only_min_readout_length_ns": 1000,
     "bare_only_min_low_power_snr": 5.0,
-    "bare_only_min_power_points": 40,
+    "bare_only_min_power_points": 30,
 }
 
 
@@ -39,12 +44,18 @@ def analyze_02c_transitions(
     run_parameters: dict[str, Any] | None = None,
     qubit_context: dict[str, dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
-    """Validate dressed/depletion/bare behavior in a 02c power sweep.
+    """Validate dressed/bare separability in a 02c power sweep.
 
-    Power is sorted from low power (more-negative dBm) to high power.  The
-    low-power tail must form the dressed-frequency plateau, the high-power
-    tail must form a distinct bare-frequency plateau, and the points between
-    them must move predominantly from dressed toward bare as power increases.
+    Power is sorted from low power (more-negative dBm) to high power.  A run
+    passes when the low-power dressed frequency and the high-power bare
+    frequency are telling apart: they must be separated by the required
+    frequency distance, each must be observed on its own classifiable points,
+    and neither may sit on a frequency-sweep edge.  The power segment in
+    between, where a point is neither clearly dressed nor clearly bare, is
+    discarded; the proposed readout power is the highest power that is still
+    classified as dressed.  Plateau stability, plateau width, depletion-point
+    count, and transition monotonicity are reported as advisory metrics and
+    only block when their ``require_*`` rule is enabled.
     """
     import numpy as np
 
@@ -192,6 +203,10 @@ def _analyze_trace(
     power = power[order]
     tracked = tracked[order]
     failures: list[str] = []
+    advisories: list[str] = []
+
+    def _record(blocking: bool, message: str) -> None:
+        (failures if blocking else advisories).append(message)
 
     min_plateau_points = max(int(rules["min_plateau_points"]), 2)
     min_depletion_points = max(int(rules["min_depletion_points"]), 1)
@@ -260,10 +275,11 @@ def _analyze_trace(
     dressed_coverage = float(np.mean(np.abs(dressed_tail - dressed_frequency) <= band))
     bare_coverage = float(np.mean(np.abs(bare_tail - bare_frequency) <= band))
     minimum_coverage = float(rules["plateau_min_coverage"])
+    stability_blocks = bool(rules["require_plateau_stability"])
     if dressed_coverage < minimum_coverage:
-        failures.append("low-power dressed plateau is not stable")
+        _record(stability_blocks, "low-power dressed plateau is not stable")
     if bare_coverage < minimum_coverage:
-        failures.append("high-power bare plateau is not stable")
+        _record(stability_blocks, "high-power bare plateau is not stable")
 
     dressed_width = _central_width(dressed_tail)
     bare_width = _central_width(bare_tail)
@@ -271,10 +287,11 @@ def _analyze_trace(
         float(rules["max_plateau_width_steps"]) * frequency_step,
         float(rules["max_plateau_width_fraction_of_separation"]) * separation,
     )
+    width_blocks = bool(rules["require_plateau_width"])
     if dressed_width > maximum_width:
-        failures.append("low-power dressed plateau width is too large")
+        _record(width_blocks, "low-power dressed plateau width is too large")
     if bare_width > maximum_width:
-        failures.append("high-power bare plateau width is too large")
+        _record(width_blocks, "high-power bare plateau width is too large")
 
     dressed_edge_fraction = _edge_fraction(
         dressed_frequency, sweep_min, sweep_max
@@ -290,33 +307,55 @@ def _analyze_trace(
     bare_start: int | None = None
     depletion_points = 0
     monotonic_fraction = 0.0
+    dressed_classified = 0
+    bare_classified = 0
+    ambiguous_classified = 0
+    min_classified = max(int(rules["min_classified_plateau_points"]), 1)
     if separation >= minimum_separation:
         normalized = (smoothed - dressed_frequency) / signed_separation
         band_fraction = min(band / separation, 0.45)
         dressed_mask = np.abs(normalized) <= band_fraction
         bare_mask = np.abs(normalized - 1.0) <= band_fraction
-        confirmation_points = 2
+        # A point that is neither clearly dressed nor clearly bare belongs to
+        # the discarded middle segment; it is counted but never selected.
+        ambiguous_classified = int(np.count_nonzero(~dressed_mask & ~bare_mask))
+        # The usable dressed part ends at the first sign of punch-out: either a
+        # confirmed exit from the dressed frequency, or the first point that has
+        # already jumped to the bare frequency, whichever comes first. Nothing
+        # above that boundary is selectable, so a bimodal transition cannot pull
+        # the proposed power toward the punch-out edge.
         transition_start = _first_confirmed_false(
-            dressed_mask, tail_count, confirmation_points
+            dressed_mask, tail_count, min_classified
         )
-        if transition_start is None:
-            failures.append("no exit from the low-power dressed plateau was found")
-        else:
-            dressed_indices = np.flatnonzero(dressed_mask[:transition_start])
-            if dressed_indices.size:
-                dressed_end = int(dressed_indices[-1])
-            else:
-                failures.append("no low-power dressed plateau points were found")
-
-        if transition_start is not None:
-            bare_start = _bare_suffix_start(
-                bare_mask,
-                max(transition_start + 1, tail_count),
-                min_plateau_points,
-                minimum_coverage,
+        bare_points = np.flatnonzero(bare_mask)
+        first_bare = int(bare_points[0]) if bare_points.size else None
+        boundaries = [
+            value for value in (transition_start, first_bare) if value is not None
+        ]
+        dressed_boundary = min(boundaries) if boundaries else int(power.size)
+        if dressed_boundary < min_plateau_points:
+            failures.append(
+                "the dressed frequency already ends inside the low-power tail; "
+                "lower min_power_dbm"
             )
-            if bare_start is None:
-                failures.append("no stable high-power bare plateau was found")
+        dressed_indices = np.flatnonzero(dressed_mask[:dressed_boundary])
+        dressed_classified = int(dressed_indices.size)
+        if dressed_classified < min_classified:
+            failures.append(
+                "too few low-power points could be classified as the dressed frequency"
+            )
+        else:
+            dressed_end = int(dressed_indices[-1])
+
+        bare_start = _confirmed_run_start(
+            bare_mask, dressed_boundary, min_classified
+        )
+        if bare_start is None:
+            failures.append(
+                "too few high-power points could be classified as the bare frequency"
+            )
+        else:
+            bare_classified = int(np.count_nonzero(bare_mask[bare_start:]))
 
         if dressed_end is not None and bare_start is not None:
             transition = normalized[dressed_end : bare_start + 1]
@@ -326,14 +365,18 @@ def _analyze_trace(
             ]
             depletion_points = int(interior.size)
             if depletion_points < min_depletion_points:
-                failures.append("depletion region has too few intermediate-frequency points")
+                _record(
+                    bool(rules["require_depletion_points"]),
+                    "depletion region has too few intermediate-frequency points",
+                )
             differences = np.diff(transition)
             if differences.size:
                 slack = float(rules["transition_monotonic_slack_fraction"])
                 monotonic_fraction = float(np.mean(differences >= -slack))
             if monotonic_fraction < float(rules["min_transition_monotonic_fraction"]):
-                failures.append(
-                    "depletion-region frequency does not move consistently from dressed to bare as power increases"
+                _record(
+                    bool(rules["require_transition_monotonic"]),
+                    "depletion-region frequency does not move consistently from dressed to bare as power increases",
                 )
 
     dressed_limit = (
@@ -372,9 +415,13 @@ def _analyze_trace(
         "bare_frequency_edge_fraction": bare_edge_fraction,
         "depletion_point_count": depletion_points,
         "transition_monotonic_fraction": monotonic_fraction,
+        "dressed_classified_point_count": dressed_classified,
+        "bare_classified_point_count": bare_classified,
+        "ambiguous_point_count": ambiguous_classified,
         "dressed_power_limit_dbm": dressed_limit,
         "selected_power_tolerance_db": selected_tolerance,
         "validation_failures": failures,
+        "advisory_notes": advisories,
     }
 
 
@@ -433,17 +480,13 @@ def _first_confirmed_false(mask: Any, start: int, count: int) -> int | None:
     return None
 
 
-def _bare_suffix_start(
-    mask: Any, start: int, confirmation_points: int, minimum_coverage: float
-) -> int | None:
+def _confirmed_run_start(mask: Any, start: int, count: int) -> int | None:
+    """First index at or after ``start`` that begins ``count`` true samples."""
     import numpy as np
 
     values = np.asarray(mask, dtype=bool)
-    for index in range(start, values.size - confirmation_points + 1):
-        if (
-            bool(np.all(values[index : index + confirmation_points]))
-            and float(np.mean(values[index:])) >= minimum_coverage
-        ):
+    for index in range(max(start, 0), values.size - count + 1):
+        if bool(np.all(values[index : index + count])):
             return index
     return None
 
