@@ -50,21 +50,21 @@ class Parameters(NodeParameters):
 
     qubits: Optional[List[str]] = None
     num_averages: int = 200
-    frequency_span_in_mhz: float = 2 #15
-    frequency_step_in_mhz: float = 0.03
+    frequency_span_in_mhz: float = 15 #15
+    frequency_step_in_mhz: float = 0.3
     simulate: bool = False
     simulation_duration_ns: int = 2500
     timeout: int = 100
-    max_power_dbm: int = 5 #-30, -10
-    min_power_dbm: int = -30 # -40
-    num_power_points: int = 50
+    max_power_dbm: int = -10 #-30, -10
+    min_power_dbm: int = -50 # -40
+    num_power_points: int = 30
     max_amp: float = 0.9 #0.1
     flux_point_joint_or_independent: Literal["joint", "independent"] = "independent"
     ro_line_attenuation_dB: float = 0
     derivative_crossing_threshold_in_hz_per_dbm: int = int(-50e3)
     derivative_smoothing_window_num_points: int = 30
     moving_average_filter_window_num_points: int = 30
-    multiplexed: bool = False
+    multiplexed: bool = True
     load_data_id: Optional[int] = None
 
 node = QualibrationNode(name="02c_Resonator_Spectroscopy_vs_Amplitude", parameters=Parameters())
@@ -145,13 +145,13 @@ with program() as multi_res_spec_vs_amp:
             with for_(*from_array(df, dfs)):  # QUA for_ loop for sweeping the frequency
                 # Update the resonator frequencies for all resonators
                 update_frequency(rr.name, df + rr.intermediate_frequency)
-                rr.wait(machine.depletion_time * u.ns)
+                rr.wait(machine.depletion_time * 100 * u.ns)
                 # QUA for_ loop for sweeping the readout amplitude
                 with for_(*from_array(a, amps)):
                     # readout the resonator
                     rr.measure("readout", qua_vars=(I[i], Q[i]), amplitude_scale=a)
                     # wait for the resonator to relax
-                    rr.wait(machine.depletion_time * u.ns)
+                    rr.wait(machine.depletion_time * 1 * u.ns)
                     # save data
                     save(I[i], I_st[i])
                     save(Q[i], Q_st[i])

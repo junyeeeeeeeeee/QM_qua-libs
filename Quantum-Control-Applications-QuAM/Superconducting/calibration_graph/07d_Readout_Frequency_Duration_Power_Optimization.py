@@ -42,10 +42,11 @@ from quam_libs.experiments.readout_optimization_3d.measurement_batching import \
 from quam_libs.trackable_object import tracked_updates
 from quam_libs.components import QuAM
 from quam_libs.experiments.readout_optimization_3d.parameters import Parameters
-from quam_libs.lib.save_utils import restore_load_data_id, resolve_qubits_from_node, get_durations
+from quam_libs.lib.save_utils import restore_load_data_id, resolve_qubits_from_node
 from quam_libs.experiments.readout_optimization_3d.parameters import (
     get_frequency_detunings_in_hz,
-    get_amplitude_factors
+    get_amplitude_factors,
+    get_durations,
 )
 from quam_libs.experiments.simulation import simulate_and_plot
 
@@ -61,7 +62,7 @@ from qm.qua import *
 node = QualibrationNode(
     name="07d_Readout_Frequency_Duration_Power_Optimization",
     parameters=Parameters(
-        qubits=None,
+        qubits=['q3', 'q4'],
         multiplexed=True,
         flux_point_joint_or_independent="joint",
         num_runs=40,

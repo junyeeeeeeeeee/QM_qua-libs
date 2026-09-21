@@ -12,8 +12,8 @@
 
 $ErrorActionPreference = "Stop"
 
-# --- Python 直譯器（請改成你的 qualibrate_env）---
-$Python = "C:\Users\richa\anaconda3\envs\qualibrate_env\python.exe"
+# --- Canonical Python：與 JY 量測模式共用同一個 qualibrate_env ---
+$Python = "D:\QM\miniforge3\envs\qualibrate_env\python.exe"
 
 # --- 路徑 ---
 $Root = Split-Path -Parent $PSScriptRoot

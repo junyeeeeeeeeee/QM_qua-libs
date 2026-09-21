@@ -25,7 +25,10 @@ def fetch_dataset(job, qubits, node_parameters: Parameters) -> xr.Dataset:
     idle_times = get_idle_times_in_clock_cycles(node_parameters)
 
     ds = fetch_results_as_xarray(job.result_handles, qubits, {"sign": [-1, 1], "time": idle_times})
-    ds = convert_IQ_to_V(ds, qubits)
+    # With use_state_discrimination the node saves only `state` streams, so
+    # there is no I/Q to convert and convert_IQ_to_V would raise KeyError.
+    if all(quadrature in ds.data_vars for quadrature in ("I", "Q")):
+        ds = convert_IQ_to_V(ds, qubits)
 
     ds = ds.assign_coords({"time": (["time"], 4 * idle_times)})
 
