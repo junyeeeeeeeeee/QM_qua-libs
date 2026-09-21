@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import PurePath
 from typing import Iterable
 
 
@@ -62,6 +63,19 @@ _QOP_COMPILE_FAILURE_TYPES = {
     "failedtoexecutejobexception",
 }
 
+# Frames inside the ``qm`` package that mean the client was handing a program
+# to the QOP rather than opening a connection to it.  Reaching any of them
+# proves the manager was created, the config was uploaded, and a quantum
+# machine was opened, because each of those is an earlier round trip.
+_PROGRAM_SUBMISSION_FUNCTIONS = {
+    "execute",
+    "add_to_queue",
+    "add_compiled",
+    "_add_program",
+    "compile",
+    "_compile",
+}
+
 _QOP_COMPILE_MESSAGE_MARKERS = (
     "compilation failed",
     "internal error. please report it to qm",
@@ -78,6 +92,15 @@ def classify_failure(exc: BaseException) -> FailureClassification:
     - a transport connection was never established, or
     - QOP rejected the program at compile/queue time with an Internal error
       (job never owned the hardware, so retaining the lock is unnecessary).
+
+    ``program_submission_timeout`` is reported separately from
+    ``instrument_unreachable``.  A deadline that expires while the program is
+    being handed to the QOP is not evidence that the instrument is
+    unreachable: every earlier call in the same run was answered.  It usually
+    means the program is too large for one submission, so the caller may
+    retry with a smaller multiplex group.  The classifier cannot tell that
+    apart from a QOP that is alive but wedged, so the caller must confirm with
+    a live reachability probe before acting on this category.
     """
 
     chain = tuple(_exception_chain(exc))
@@ -88,6 +111,14 @@ def classify_failure(exc: BaseException) -> FailureClassification:
         return FailureClassification(
             "qop_compile_failure",
             safe_to_release_lock=True,
+        )
+
+    # Checked before the connectivity markers below, which deliberately still
+    # match "deadline exceeded" for a deadline that expires anywhere else.
+    if _looks_like_program_submission_timeout(exc, type_names, messages):
+        return FailureClassification(
+            "program_submission_timeout",
+            safe_to_release_lock=False,
         )
 
     specific_type = bool(type_names & _INSTRUMENT_CONNECTION_TYPES)
@@ -110,6 +141,89 @@ def classify_failure(exc: BaseException) -> FailureClassification:
         "instrument_unreachable",
         safe_to_release_lock=safe_to_release,
     )
+
+
+def _looks_like_program_submission_timeout(
+    exc: BaseException, type_names: set[str], messages: str
+) -> bool:
+    """Report a deadline that expired while submitting a program.
+
+    Requires all three of: a QM timeout type, a gRPC ``DEADLINE_EXCEEDED``
+    status rather than a transport failure, and a ``qm`` package frame that
+    submits a program.  A transport-level marker anywhere in the chain vetoes
+    it, so a connection that dropped mid-submission stays an outage.
+    """
+
+    if "qmtimeouterror" not in type_names:
+        return False
+    if _has_transport_failure(type_names, messages):
+        return False
+    status = _grpc_status_name(exc)
+    if status is not None and status != "DEADLINE_EXCEEDED":
+        return False
+    if status is None and "deadline exceeded" not in messages:
+        return False
+    return _failed_during_program_submission(exc)
+
+
+def _has_transport_failure(type_names: set[str], messages: str) -> bool:
+    """Report evidence that the transport itself failed, not just a deadline."""
+
+    if type_names & _NO_CONNECTION_ESTABLISHED_TYPES:
+        return True
+    markers = (
+        "statuscode.unavailable",
+        "grpc_status:14",
+        "connection refused",
+        "connection reset",
+        "connection aborted",
+        "network is unreachable",
+        "host is unreachable",
+        "name or service not known",
+        "temporary failure in name resolution",
+    )
+    return any(marker in messages for marker in markers)
+
+
+def _grpc_status_name(exc: BaseException) -> str | None:
+    """Return the gRPC status name carried by any error in the chain."""
+
+    for item in _exception_chain(exc):
+        code = getattr(item, "code", None)
+        if not callable(code):
+            continue
+        try:
+            value = code()
+        except Exception:  # pragma: no cover - defensive
+            continue
+        name = getattr(value, "name", None)
+        if isinstance(name, str) and name:
+            return name
+    return None
+
+
+def _failed_during_program_submission(exc: BaseException) -> bool:
+    for name, filename in _traceback_frames(exc):
+        if name in _PROGRAM_SUBMISSION_FUNCTIONS and _is_qm_frame(filename):
+            return True
+    return False
+
+
+def _is_qm_frame(filename: str) -> bool:
+    try:
+        parts = PurePath(filename).parts
+    except (TypeError, ValueError):  # pragma: no cover - defensive
+        return False
+    return "qm" in parts
+
+
+def _traceback_frames(exc: BaseException) -> Iterable[tuple[str, str]]:
+    for item in _exception_chain(exc):
+        tb = item.__traceback__
+        while tb is not None:
+            code = tb.tb_frame.f_code
+            yield code.co_name, code.co_filename
+            tb = tb.tb_next
 
 
 def _looks_like_qop_compile_failure(

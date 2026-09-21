@@ -15,7 +15,8 @@ from pathlib import Path
 from typing import Any
 
 from .db import Database
-from .failures import classify_failure
+from .failures import FailureClassification, classify_failure
+from .instrument_probe import ProbeResult, probe_qop
 from .runner import release_worker_lock
 from .util import atomic_write_json, json_compatible, sha256_file, utc_now
 
@@ -260,10 +261,20 @@ def run_request(request_path: Path) -> int:
     except Exception as exc:
         message = "".join(traceback.format_exception(exc))
         classification = classify_failure(exc)
+        attempted_targets = _attempted_targets(request)
+        classification, probe, submission_timeout, submission_escalated = (
+            _resolve_submission_timeout(
+                classification, request, attempted_targets
+            )
+        )
         instrument_unreachable = (
             classification.category == "instrument_unreachable"
         )
         qop_compile_failure = classification.category == "qop_compile_failure"
+        # A submission timeout pauses only when a single target already failed
+        # to be accepted; with more than one target the group is halved and the
+        # lease keeps running.
+        measurement_paused = instrument_unreachable or submission_escalated
         hardware_cleanup_verified = bool(
             (
                 instrument_unreachable
@@ -273,7 +284,7 @@ def run_request(request_path: Path) -> int:
         )
         hardware_cleanup_error: str | None = None
         if (
-            instrument_unreachable
+            (instrument_unreachable or submission_timeout)
             and not hardware_cleanup_verified
             and execution_phase == "hardware_execution"
         ):
@@ -285,22 +296,34 @@ def run_request(request_path: Path) -> int:
         )
         after_hash = sha256_file(active_state) if active_state.is_file() else observed_hash
         cleanup_verified = after_hash == before_hash and not restore_error
+        # Operator instruction: an instrument-connectivity failure must never
+        # engage the hardware lock, so it releases on an unchanged state file
+        # even when cleanup could not be confirmed -- the instrument being
+        # unreachable is exactly why the evidence is missing.  Every other
+        # releasable category still requires verified hardware cleanup.
+        # A program that was never accepted never owned the hardware, so a
+        # submission timeout releases on the same unchanged-state evidence.
         release_after_verified_cleanup = bool(
             cleanup_verified
-            and hardware_cleanup_verified
             and (
                 instrument_unreachable
-                or (qop_compile_failure and classification.safe_to_release_lock)
+                or submission_timeout
+                or (
+                    hardware_cleanup_verified
+                    and qop_compile_failure
+                    and classification.safe_to_release_lock
+                )
             )
         )
         if release_after_verified_cleanup:
             release_lock = True
             recovery_path.unlink(missing_ok=True)
-        termination_cause = (
-            "instrument_unreachable"
-            if instrument_unreachable
-            else "worker_exception"
-        )
+        if instrument_unreachable:
+            termination_cause = "instrument_unreachable"
+        elif submission_timeout:
+            termination_cause = "program_submission_timeout"
+        else:
+            termination_cause = "worker_exception"
         failure = {
             "analysis_status": "failed",
             "node_id": request["node_id"],
@@ -319,25 +342,19 @@ def run_request(request_path: Path) -> int:
             "active_state_restore_error": restore_error,
             "failure_category": classification.category,
             "execution_phase": execution_phase,
-            "measurement_paused": instrument_unreachable,
+            "measurement_paused": measurement_paused,
+            "attempted_target_count": len(attempted_targets),
+            "instrument_probe": probe.as_dict() if probe is not None else None,
             "hardware_cleanup_verified": hardware_cleanup_verified,
             "hardware_cleanup_error": hardware_cleanup_error,
             "hardware_lock_recovery_required": (
                 instrument_unreachable and not release_after_verified_cleanup
             ),
-            "operator_message": {
-                "zh-Hant": (
-                    "儀器連線失敗，本次實驗與後續排程已暫停。請檢查 QOP/OPX、"
-                    "儀器電源與實驗室網路；確認後回 AI 對話輸入「恢復量測」。"
-                ),
-                "en": (
-                    "Instrument connectivity failed, so this experiment and new "
-                    "scheduling were paused. Check QOP/OPX, instrument power, and "
-                    "the lab network, then enter 'Resume measurement' in the AI conversation."
-                ),
-            }
-            if instrument_unreachable
-            else None,
+            "operator_message": _failure_operator_message(
+                instrument_unreachable=instrument_unreachable,
+                submission_escalated=submission_escalated,
+                probe=probe,
+            ),
         }
         database.execute(
             """
@@ -352,7 +369,7 @@ def run_request(request_path: Path) -> int:
                 json.dumps(failure, ensure_ascii=False), termination_cause, run_id,
             ),
         )
-        if instrument_unreachable:
+        if measurement_paused:
             _pause_for_instrument_failure(
                 database,
                 run_id=run_id,
@@ -360,13 +377,15 @@ def run_request(request_path: Path) -> int:
                 lock_retained=not release_after_verified_cleanup,
             )
         database.event(
-            "instrument_error_paused" if instrument_unreachable else "run_failed",
+            "instrument_error_paused" if measurement_paused else "run_failed",
             "worker",
             {
                 "run_id": run_id,
                 "error": str(exc),
                 "active_state_restored": restored,
                 "failure_category": classification.category,
+                "attempted_target_count": len(attempted_targets),
+                "instrument_probe": probe.as_dict() if probe is not None else None,
                 "hardware_cleanup_verified": hardware_cleanup_verified,
                 "hardware_lock_retained": not release_lock,
             },
@@ -407,6 +426,129 @@ def run_request(request_path: Path) -> int:
             receipt,
             str(request.get("process_token") or ""),
         )
+
+
+def _attempted_targets(request: dict[str, Any]) -> list[str]:
+    parameters = request.get("parameters")
+    targets = parameters.get("qubits") if isinstance(parameters, dict) else None
+    if not isinstance(targets, list):
+        return []
+    return [str(name) for name in targets]
+
+
+def _resolve_submission_timeout(
+    classification: FailureClassification,
+    request: dict[str, Any],
+    attempted_targets: list[str],
+) -> tuple[FailureClassification, ProbeResult | None, bool, bool]:
+    """Confirm a submission timeout against the live instrument.
+
+    The traceback proves the program was being submitted rather than the
+    connection being opened, but it cannot tell a program that is too large
+    from a QOP that is wedged.  Ask the instrument.  If it answers, the
+    program was too large and the lease keeps running so the caller can halve
+    the multiplex group; a single target that still times out is out of
+    halving room and goes to the operator.  If it does not answer, this was an
+    outage after all and it is reclassified.
+
+    Returns the classification to use, the probe result, whether this is a
+    confirmed submission timeout, and whether it must pause anyway.
+    """
+
+    if classification.category != "program_submission_timeout":
+        return classification, None, False, False
+
+    # This runs inside the failure handler, so a probe that raises would lose
+    # the original error. Any surprise means reachability is unconfirmed, which
+    # is the conservative verdict: pause instead of halving.
+    try:
+        probe = probe_qop(Path(str(request.get("wiring_path") or "")))
+    except Exception as probe_error:  # pragma: no cover - defensive
+        probe = ProbeResult(
+            reachable=False,
+            stage="probe",
+            cause="unknown",
+            detail=f"Reachability probe failed: {probe_error}",
+        )
+    if not probe.reachable:
+        return (
+            FailureClassification(
+                "instrument_unreachable",
+                safe_to_release_lock=probe.stage in {"dns", "tcp"},
+            ),
+            probe,
+            False,
+            False,
+        )
+    return classification, probe, True, len(attempted_targets) <= 1
+
+
+def _failure_operator_message(
+    *,
+    instrument_unreachable: bool,
+    submission_escalated: bool,
+    probe: ProbeResult | None,
+) -> dict[str, str] | None:
+    if submission_escalated:
+        detail = probe.detail if probe is not None else ""
+        return {
+            "zh-Hant": (
+                "單一 qubit 的程式仍然無法送進 QOP，已無法再拆分，本次實驗與"
+                "後續排程已暫停。儀器有回應健康檢查，所以這不是網路問題，"
+                "請檢查 QOP 的工作佇列或重啟 QOP；確認後回 AI 對話輸入"
+                "「恢復量測」。"
+            ),
+            "en": (
+                "A single-qubit program still could not be submitted to the "
+                "QOP and there is no group left to halve, so this experiment "
+                "and new scheduling were paused. The instrument answered a "
+                "health check, so this is not a network fault: check the QOP "
+                "job queue or restart the QOP, then enter 'Resume measurement' "
+                f"in the AI conversation. {detail}"
+            ).strip(),
+        }
+    if not instrument_unreachable:
+        return None
+    detail = probe.detail if probe is not None else ""
+    if probe is not None and probe.cause == "network":
+        return {
+            "zh-Hant": (
+                "無法連線到 QOP（網路層級），本次實驗與後續排程已暫停。"
+                "請檢查實驗室網路、線路與主機位址；確認後回 AI 對話輸入"
+                "「恢復量測」。"
+            ),
+            "en": (
+                "The QOP could not be reached at the network level, so this "
+                "experiment and new scheduling were paused. Check the lab "
+                "network, cabling, and host address, then enter 'Resume "
+                f"measurement' in the AI conversation. {detail}"
+            ).strip(),
+        }
+    if probe is not None and probe.cause == "instrument":
+        return {
+            "zh-Hant": (
+                "網路可達但 QOP 沒有回應，本次實驗與後續排程已暫停。"
+                "請檢查 QOP/OPX 電源與服務狀態，必要時重啟；確認後回 AI "
+                "對話輸入「恢復量測」。"
+            ),
+            "en": (
+                "The network is reachable but the QOP did not respond, so "
+                "this experiment and new scheduling were paused. Check QOP/OPX "
+                "power and service state, restart if needed, then enter "
+                f"'Resume measurement' in the AI conversation. {detail}"
+            ).strip(),
+        }
+    return {
+        "zh-Hant": (
+            "儀器連線失敗，本次實驗與後續排程已暫停。請檢查 QOP/OPX、"
+            "儀器電源與實驗室網路；確認後回 AI 對話輸入「恢復量測」。"
+        ),
+        "en": (
+            "Instrument connectivity failed, so this experiment and new "
+            "scheduling were paused. Check QOP/OPX, instrument power, and "
+            "the lab network, then enter 'Resume measurement' in the AI conversation."
+        ),
+    }
 
 
 def _pause_for_instrument_failure(

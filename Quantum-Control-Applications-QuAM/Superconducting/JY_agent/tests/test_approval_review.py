@@ -12,6 +12,8 @@ from starlette.testclient import TestClient
 
 from jy_agent.approval_server import create_approval_app
 from jy_agent.approval_web import (
+    _session_summary_section,
+    _successful_qubits,
     handle_browser_approval,
     handle_browser_approval_asset,
 )
@@ -342,6 +344,86 @@ class ApprovalReviewTests(unittest.TestCase):
                 )
             )
             self.assertEqual(refused.status_code, 404)
+
+
+class ResultSummaryTests(unittest.TestCase):
+    """The results page summary lists one row per experiment of a session."""
+
+    @staticmethod
+    def _item(node_id, status, analysis_status, outcomes, assets):
+        return {
+            "run": {"node_id": node_id, "status": status},
+            "analysis": (
+                None
+                if analysis_status is None
+                else {
+                    "analysis_status": analysis_status,
+                    "outcomes_advisory": outcomes,
+                }
+            ),
+            "asset_indices": assets,
+        }
+
+    def test_a_qubit_counts_only_when_the_run_passed_and_the_node_agreed(self) -> None:
+        passed = self._item(
+            "02x",
+            "completed",
+            "pass",
+            {"q10": "successful", "q2": "successful", "q1": "failed"},
+            [0],
+        )
+        self.assertEqual(_successful_qubits(passed), ["q2", "q10"])
+
+        # A needs_review run never reports a success, even when the node did.
+        unreviewed = self._item(
+            "02c", "completed", "needs_review", {"q1": "successful"}, [1]
+        )
+        self.assertEqual(_successful_qubits(unreviewed), [])
+
+        self.assertEqual(
+            _successful_qubits(self._item("04", "running", None, {}, [])), []
+        )
+
+    def test_summary_shows_qubits_and_plots_only_for_successful_runs(self) -> None:
+        history = [
+            self._item("02x", "completed", "pass", {"q1": "successful"}, [0, 1]),
+            self._item("02c", "completed", "needs_review", {"q1": "successful"}, [2]),
+            self._item("03a", "failed", "failed", {}, []),
+            self._item("04", "running", None, {}, []),
+        ]
+        html = _session_summary_section("session-id", history, "zh-Hant")
+
+        self.assertIn("結果摘要", html)
+        for ordinal, node_id in enumerate(("02x", "02c", "03a", "04"), start=1):
+            self.assertIn(f"實驗 {ordinal}: {node_id}", html)
+            self.assertIn(f'data-experiment-link="{ordinal}"', html)
+
+        self.assertIn("成功：q1", html)
+        self.assertIn("/session/session-id/assets/0", html)
+        self.assertIn("/session/session-id/assets/1", html)
+        # Rows without a proven success carry no qubit list and no plot.
+        self.assertNotIn("/session/session-id/assets/2", html)
+        self.assertEqual(html.count("未成功"), 2)
+        self.assertIn("執行中", html)
+
+    def test_summary_caps_thumbnails_and_reports_the_remainder(self) -> None:
+        history = [
+            self._item(
+                "05", "completed", "pass", {"q1": "successful"}, list(range(8))
+            )
+        ]
+        html = _session_summary_section("session-id", history, "zh-Hant")
+
+        self.assertIn("/session/session-id/assets/5", html)
+        self.assertNotIn("/session/session-id/assets/6", html)
+        self.assertIn("另有 2 張結果圖", html)
+
+    def test_summary_without_any_experiment_explains_the_empty_page(self) -> None:
+        html = _session_summary_section("session-id", [], "zh-Hant")
+
+        self.assertIn("結果摘要", html)
+        self.assertIn("尚未執行任何實驗", html)
+        self.assertNotIn("data-experiment-link", html)
 
 
 if __name__ == "__main__":

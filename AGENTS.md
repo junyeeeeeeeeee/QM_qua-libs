@@ -50,7 +50,17 @@ goals cannot promise indefinite agent lifetime and must use the Dashboard's
 Return only the entry result's top-level `browser_url`; approval, control, and
 result-history fields are internal navigation metadata for the same Dashboard
 service, not separate websites. The public `browser_url` is the common `/` entry;
-its Home, Approval, and Results & controls pages share one session and origin.
+its Home, Approval, and Experiment results pages share one session and origin.
+Return the bare Cloudflare URL without token/query parameters. Each browser signs
+in with the fixed password stored in ignored
+`JY_agent/runtime/dashboard-password.txt`; do not create or request device-pairing links.
+After the operator sends `已核准` / `Approved`, the next reply starts with
+exactly `已核准`. While measurement mode is open, any paused turn copies
+`operator_handoff.chat` as a three-item markdown list, never as one paragraph,
+so the operator always sees what to do, which exact phrase to send afterwards,
+and the shutdown hint. A live turn may execute
+`結束量測` directly; a paused or disconnected turn needs Dashboard Home
+shutdown first, then `結束量測` to verify.
 
 Treat configured stop/exit phrases including `退出 JY 量測模式`, `結束量測`, and
 `停止量測` as a full safe shutdown: persist the shutdown request, cooperatively
@@ -64,8 +74,12 @@ lock, or expose the MCP listener publicly.
 
 Recognized instrument-connectivity failures pause the current experiment and
 new scheduling instead of presenting a generic crash. Do not schedule another
-run until the operator resumes after fixing QOP/OPX, instrument power, or the lab
-network. If the AI client disconnects, Dashboard controls remain authoritative;
+run until the operator fixes QOP/OPX, instrument power, or the lab network and
+issues `恢復量測` / `Resume measurement`; call
+`jy_resume_measurement_mode` for the same workflow. The current node restarts
+from the beginning as a new run; never claim that the interrupted Python stack
+continues. A retained hardware lock still blocks resume and requires the local
+operator recovery console. If the AI client disconnects, Dashboard controls remain authoritative;
 after connectivity returns, `結束量測` or `End measurement` verifies full
 shutdown. Treat `暫停 JY 自動量測` / `Pause JY automatic measurement`, `繼續 JY
 自動量測` / `Resume JY automatic measurement`, `結束 JY 自動授權` / `End JY

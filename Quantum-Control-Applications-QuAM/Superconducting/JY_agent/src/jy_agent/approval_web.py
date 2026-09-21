@@ -4,6 +4,7 @@ import asyncio
 import getpass
 import ipaddress
 import json
+import re
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from html import escape
@@ -23,6 +24,7 @@ from .service import AgentService, ServiceError
 
 
 MAX_FORM_BYTES = 4096
+SUMMARY_THUMBNAIL_LIMIT = 6
 TAIPEI_TIMEZONE = timezone(timedelta(hours=8), name="Asia/Taipei")
 SECURITY_HEADERS = {
     "Cache-Control": "no-store",
@@ -52,6 +54,7 @@ AUTONOMY_EVENTS_SCRIPT = """(() => {
 SESSION_DASHBOARD_SCRIPT = """(() => {
   const selector = document.querySelector('[data-experiment-selector]');
   const panels = Array.from(document.querySelectorAll('[data-experiment-panel]'));
+  const available = panels.map((panel) => panel.dataset.experimentPanel);
   const show = (value) => {
     panels.forEach((panel) => { panel.hidden = panel.dataset.experimentPanel !== value; });
     if (selector) selector.value = value;
@@ -59,10 +62,20 @@ SESSION_DASHBOARD_SCRIPT = """(() => {
     url.searchParams.set('experiment', value);
     window.history.replaceState({}, '', url);
   };
-  if (selector && panels.length) {
-    selector.addEventListener('change', () => show(selector.value));
+  if (panels.length) {
+    if (selector) selector.addEventListener('change', () => show(selector.value));
+    document.querySelectorAll('[data-experiment-link]').forEach((link) => {
+      link.addEventListener('click', (event) => {
+        const index = available.indexOf(link.dataset.experimentLink);
+        if (index < 0) return;
+        event.preventDefault();
+        show(available[index]);
+        if (panels[index].scrollIntoView) {
+          panels[index].scrollIntoView({ behavior: 'smooth', block: 'start' });
+        }
+      });
+    });
     const requested = new URL(window.location.href).searchParams.get('experiment');
-    const available = panels.map((panel) => panel.dataset.experimentPanel);
     show(available.includes(requested) ? requested : available[available.length - 1]);
   }
   const eventsUrl = document.body.dataset.sessionEvents;
@@ -167,6 +180,7 @@ _ZH_ENUMS = {
     "completed": "已完成",
     "failed": "失敗",
     "instrument_unreachable": "儀器無法連線",
+    "program_submission_timeout": "程式提交逾時（儀器正常）",
     "qop_compile_failure": "QOP 編譯失敗",
     "pass": "通過",
     "needs_review": "需要審閱",
@@ -408,7 +422,7 @@ async def handle_autonomy_control(
     if request.method == "GET":
         redirect = _session_view_redirect(
             service.dashboard_session_id_for_workflow(str(status["workflow_id"])),
-            "results",
+            "home",
             language,
         )
         if redirect is not None:
@@ -472,7 +486,7 @@ async def handle_autonomy_control(
         )
     redirect = _session_view_redirect(
         service.dashboard_session_id_for_workflow(str(result["workflow_id"])),
-        "results",
+        "home",
         language,
     )
     if redirect is not None:
@@ -668,9 +682,9 @@ async def handle_session_dashboard(
         )
         operation = _single_field(fields, "operation")
         if view is not None and operation not in {
-            "home": {"shutdown"},
+            "home": {"shutdown", "control"},
             "approval": {"approve"},
-            "results": {"control"},
+            "results": set(),
         }[resolved_view]:
             raise ServiceError("This control does not belong to the current Dashboard page.")
         if operation == "approve":
@@ -700,7 +714,7 @@ async def handle_session_dashboard(
                     "Return to the conversation and enter ‘已核准’ to start the experiment.",
                 )
         elif operation == "control":
-            resolved_view = "results"
+            resolved_view = "home"
             session = review["session"]
             lease_id = str(session.get("autonomy_lease_id") or "")
             if not lease_id:
@@ -952,7 +966,7 @@ def _session_dashboard_page(
         autonomy_controls = f"""
         <section class="card"><h2>{_ui(language, '自動授權控制', 'Automation authorization controls')}</h2>
           <p>{_ui(language, '暫停會讓目前實驗完成後不再排新實驗；繼續可恢復同一份未過期授權。', 'Pause lets the current run finish and prevents new scheduling; Resume continues the same unexpired authorization.')}</p>
-          <form method="post" action="/session/{escape(session_id)}/results?lang={escape(language)}">
+          <form method="post" action="/session/{escape(session_id)}/home?lang={escape(language)}">
             <input type="hidden" name="operation" value="control">
             <input type="hidden" name="csrf_token" value="{escape(csrf)}">
             {pause_or_resume}
@@ -1012,6 +1026,9 @@ def _session_dashboard_page(
           <p>{_ui(language, '關閉狀態', 'Shutdown status')}：{escape(_localized_enum(language, shutdown_status))}</p>
         </section>"""
 
+    summary_html = _session_summary_section(
+        session_id, review.get("history", []), language
+    )
     history_html = _session_history_section(
         session_id, review.get("history", []), language
     )
@@ -1031,7 +1048,7 @@ def _session_dashboard_page(
     <nav class="dashboard-nav" aria-label="{_ui(language, 'Dashboard 分頁', 'Dashboard pages')}">
       <a class="{'active' if view == 'home' else ''}" href="{escape(home_path)}">{_ui(language, '首頁', 'Home')}</a>
       <a class="{'active' if view == 'approval' else ''}" href="{escape(approval_path)}">{_ui(language, '核准', 'Approval')} <span class="badge">{pending_count}</span></a>
-      <a class="{'active' if view == 'results' else ''}" href="{escape(results_path)}">{_ui(language, '結果與控制', 'Results & controls')} <span class="badge">{result_count}</span></a>
+      <a class="{'active' if view == 'results' else ''}" href="{escape(results_path)}">{_ui(language, '實驗結果', 'Experiment results')} <span class="badge">{result_count}</span></a>
     </nav>"""
     status_html = f"""
     <section class="card"><dl>
@@ -1062,13 +1079,19 @@ def _session_dashboard_page(
         page_intro = _ui(language, "此頁只處理待核准動作；新提案出現時才會自動更新。", "This page is only for pending approvals and refreshes when a proposal changes.")
         page_content = approval_html
     elif view == "results":
-        page_title = _ui(language, "JY 實驗結果與控制", "JY results and controls")
-        page_intro = _ui(language, "所有實驗結果會保留到服務關閉；此頁只在結果、判斷或控制狀態改變時更新。", "All results remain until the service closes. This page refreshes only for results, decisions, or control-state changes.")
-        page_content = autonomy_controls + history_html
+        page_title = _ui(language, "JY 實驗結果", "JY experiment results")
+        page_intro = _ui(language, "所有實驗結果會保留到服務關閉；此頁只在結果或判斷改變時更新。暫停、停止與關機控制已移到首頁。", "All results remain until the service closes. This page refreshes only for results or decisions. Pause, stop, and shutdown controls are on the Home page.")
+        page_content = summary_html + history_html
     else:
         page_title = _ui(language, "JY 量測首頁", "JY measurement home")
-        page_intro = _ui(language, "手機與電腦共用此工作階段入口；核准與結果使用下方分頁。AI 對話仍在原本的 App。", "Phones and computers share this session entry. Approval and results use the pages below; AI conversation remains in the original app.")
-        page_content = status_html + shutdown_control + continuity_html + device_html
+        page_intro = _ui(language, "手機與電腦共用此工作階段入口；量測控制在本頁，核准與結果使用下方分頁。AI 對話仍在原本的 App。", "Phones and computers share this session entry. Measurement controls are on this page; approval and results use the pages below. AI conversation remains in the original app.")
+        page_content = (
+            status_html
+            + autonomy_controls
+            + shutdown_control
+            + continuity_html
+            + device_html
+        )
     html = f"""<!doctype html>
 <html lang="{escape(language)}"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -1090,6 +1113,16 @@ pre {{ overflow:auto; white-space:pre-wrap; word-break:break-word; background:#0
 .result-grid {{ display:grid; grid-template-columns:repeat(auto-fit,minmax(min(100%,300px),1fr)); gap:14px; }}
 figure {{ margin:0; padding:10px; background:#070d18; border-radius:10px; }}
 img {{ display:block; width:100%; height:auto; border-radius:7px; }}
+.summary-list {{ margin:0; padding:0; list-style:none; }}
+.summary-row {{ display:grid; grid-template-columns:minmax(150px,230px) 1fr; gap:6px 16px; align-items:start; padding:12px 0; border-top:1px solid #21304d; }}
+.summary-row:first-child {{ border-top:0; padding-top:4px; }}
+.summary-name a {{ color:#cfe0ff; font-weight:700; text-decoration:none; overflow-wrap:anywhere; }}
+.summary-name a:hover {{ text-decoration:underline; }}
+.summary-row p {{ margin:0 0 6px; }}
+.summary-ok {{ color:#8ce0b0; overflow-wrap:anywhere; }}
+.summary-thumbs {{ display:flex; flex-wrap:wrap; gap:8px; }}
+.summary-thumbs a {{ display:block; width:112px; }}
+.summary-thumbs img {{ width:112px; border:1px solid #2b3b5d; background:#070d18; }}
 select,input,button {{ width:100%; padding:12px; border-radius:8px; font:inherit; }}
 select,input {{ color:white; background:#07101f; border:1px solid #6680b5; }}
 button {{ margin-top:12px; border:0; color:white; background:#3568e8; font-weight:750; cursor:pointer; }}
@@ -1105,7 +1138,7 @@ button {{ margin-top:12px; border:0; color:white; background:#3568e8; font-weigh
 .dashboard-nav a.active {{ background:#234b9d; border-color:#7ba2ff; color:white; }}
 .badge {{ display:inline-block; min-width:1.5em; margin-left:4px; padding:0 .4em; border-radius:999px; background:#07101f; }}
 [hidden] {{ display:none !important; }}
-@media(max-width:600px) {{ dl {{ grid-template-columns:1fr; gap:2px; }} dd {{ margin-bottom:8px; }} .dashboard-nav {{ grid-template-columns:1fr; }} }}
+@media(max-width:600px) {{ dl {{ grid-template-columns:1fr; gap:2px; }} dd {{ margin-bottom:8px; }} .dashboard-nav {{ grid-template-columns:1fr; }} .summary-row {{ grid-template-columns:1fr; }} }}
 </style></head>
 <body data-session-events="{escape(events_url)}">{_language_switch(language)}<main>
 <h1>{escape(page_title)}</h1>
@@ -1130,7 +1163,13 @@ def _instrument_pause_notice(
         return ""
     for item in reversed(review.get("history", [])):
         analysis = item.get("analysis") or {}
-        if analysis.get("failure_category") != "instrument_unreachable":
+        category = analysis.get("failure_category")
+        # A probe-confirmed submission timeout only reaches this banner when
+        # it escalated, which is the single-target case that does pause.
+        if category == "program_submission_timeout":
+            if not analysis.get("measurement_paused"):
+                continue
+        elif category != "instrument_unreachable":
             continue
         messages = analysis.get("operator_message") or {}
         message = messages.get(language) or messages.get("en") or _ui(
@@ -1154,6 +1193,122 @@ def _instrument_pause_notice(
           <p>{_ui(language, '現場確認儀器可連線後，請用此頁「繼續排程」，或回 AI 對話輸入「恢復量測」／“Resume measurement”；目前節點會以新 run 從頭執行。', 'After connectivity is restored, use Resume scheduling on this page, or send “Resume measurement” in the AI conversation. The current node restarts as a new run.')}</p>
         </section>"""
     return ""
+
+
+def _natural_name_key(name: str) -> tuple[Any, ...]:
+    """Sort q2 before q10 instead of lexicographically."""
+    return tuple(
+        int(part) if part.isdigit() else part
+        for part in re.split(r"(\d+)", str(name))
+    )
+
+
+def _successful_qubits(item: dict[str, Any]) -> list[str]:
+    """Qubits this run proved successful.
+
+    Judged per target, not per run. `passing_targets` is JY's own per-qubit
+    verdict and is exactly what gates a state commit, so a run that is
+    `needs_review` overall still reports the qubits that passed inside it -
+    otherwise a node like 05, where nine of ten qubits passed and committed,
+    would read as a failure on the summary.
+
+    A single-pass node is different again: it runs once on the node defaults
+    and the workflow accepts the result by design, so every target it measured
+    counts.
+    """
+
+    run = item.get("run") or {}
+    analysis = item.get("analysis") or {}
+    status = str(run.get("status") or "")
+
+    if run.get("single_pass") and status == "completed":
+        targets = (run.get("parameters") or {}).get("qubits")
+        if isinstance(targets, list):
+            return sorted(
+                (str(name) for name in targets), key=_natural_name_key
+            )
+
+    passing = analysis.get("passing_targets")
+    if isinstance(passing, list):
+        return sorted((str(name) for name in passing), key=_natural_name_key)
+
+    if str(analysis.get("analysis_status") or "") != "pass":
+        return []
+    outcomes = analysis.get("outcomes_advisory")
+    if not isinstance(outcomes, dict):
+        return []
+    return sorted(
+        (
+            str(name)
+            for name, value in outcomes.items()
+            if str(value) == "successful"
+        ),
+        key=_natural_name_key,
+    )
+
+
+def _session_summary_section(
+    session_id: str,
+    history: list[dict[str, Any]],
+    language: str = "zh-Hant",
+) -> str:
+    """List every experiment of this session with its successful qubits."""
+    heading = _ui(language, "結果摘要", "Result summary")
+    if not history:
+        return (
+            f'<section class="card"><h2>{heading}</h2>'
+            f'<p>{_ui(language, "本次啟動後尚未執行任何實驗。", "No experiment has run since this session started.")}</p></section>'
+        )
+    separator = ", " if language == "en" else "、"
+    rows: list[str] = []
+    for ordinal, item in enumerate(history, start=1):
+        run = item.get("run") or {}
+        label = f'{_ui(language, "實驗", "Experiment")} {ordinal}: {run.get("node_id")}'
+        target = f'?lang={escape(language)}&amp;experiment={ordinal}'
+        qubits = _successful_qubits(item)
+        if qubits:
+            asset_indices = list(item.get("asset_indices", []))
+            shown = asset_indices[:SUMMARY_THUMBNAIL_LIMIT]
+            thumbnails = "".join(
+                f'<a href="{target}" data-experiment-link="{ordinal}">'
+                f'<img src="/session/{escape(session_id)}/assets/{asset_index}" '
+                f'alt="{escape(_ui(language, "實驗結果圖", "Experiment result plot"))} {ordinal}-{plot_number}" '
+                f'loading="lazy"></a>'
+                for plot_number, asset_index in enumerate(shown, start=1)
+            )
+            if thumbnails:
+                remaining = len(asset_indices) - len(shown)
+                extra = (
+                    f'<p class="muted">{_ui(language, "另有", "Plus")} {remaining} '
+                    f'{_ui(language, "張結果圖", "more plots")}</p>'
+                    if remaining > 0
+                    else ""
+                )
+                figures = f'<div class="summary-thumbs">{thumbnails}</div>{extra}'
+            else:
+                figures = (
+                    f'<p class="muted">{_ui(language, "此筆實驗沒有可用的結果圖。", "No result plot is available for this experiment.")}</p>'
+                )
+            outcome = (
+                f'<p class="summary-ok">{_ui(language, "成功：", "Successful: ")}'
+                f'{escape(separator.join(qubits))}</p>{figures}'
+            )
+        elif str(run.get("status")) in {"starting", "running", "stopping"}:
+            outcome = (
+                f'<p class="muted">{escape(_localized_enum(language, run.get("status")))}</p>'
+            )
+        else:
+            outcome = f'<p class="muted">{_ui(language, "未成功", "Not successful")}</p>'
+        rows.append(
+            f'<li class="summary-row"><div class="summary-name">'
+            f'<a href="{target}" data-experiment-link="{ordinal}">{escape(label)}</a>'
+            f'</div><div>{outcome}</div></li>'
+        )
+    return (
+        f'<section class="card"><h2>{heading}</h2>'
+        f'<p class="muted">{_ui(language, "只有 JY 判定通過、且節點回報成功的 qubit 才會列出結果圖；點任一列可跳到該次實驗的完整結果。", "Plots appear only for qubits that JY passed and the node reported as successful. Select a row to open that experiment in full.")}</p>'
+        f'<ol class="summary-list">{"".join(rows)}</ol></section>'
+    )
 
 
 def _session_history_section(

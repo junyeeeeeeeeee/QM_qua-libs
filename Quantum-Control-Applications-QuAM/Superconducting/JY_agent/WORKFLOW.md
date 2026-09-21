@@ -51,7 +51,7 @@ PID、port 與 Python 路徑記錄到 `runtime/server-bootstrap.json`。長駐 S
   goal，會建立 session-scoped goal，並用 `jy_wait_for_autonomy_status` 等待事件；
   Claude/Cursor 的 host 若結束 turn，需以 Dashboard 的 `已核准` 提示續跑。
 - 對使用者只呈現 entry response 最外層的 `browser_url`。這個 `/` 是共用入口，
-  會連到同一 session 的首頁、核准、結果與控制分頁；舊 `/approve/...`、
+  會連到同一 session 的首頁、核准、實驗結果分頁；舊 `/approve/...`、
   `/autonomy/...` 與 `/session/...` 路徑只做 303 redirect。
   直接呼叫 lease request 或替換停止過的 lease 時，service 仍必須重用並重新綁定
   同一個 workflow session。
@@ -169,11 +169,12 @@ the MCP connection before its `initialize` response.
   handles per-run and per-state-change approval.
 - `進入 JY 自動量測模式` calls `jy_enter_autonomy_mode` the same way. One Dashboard approval
   activates a bounded lease; later actions must remain within targets, nodes,
-  eight hours, 20 attempts per node/qubit, and hard parameter policy. Codex uses
+  a lease budget (eight hours by default, specifiable at entry), 20 attempts per
+  node/qubit, and hard parameter policy. Codex uses
   a session-scoped durable goal when available and waits with
   `jy_wait_for_autonomy_status`; Claude/Cursor require a host resume if their turn ends.
 - Surface only the entry response's top-level `browser_url`. The common `/`
-  entry links to Home, Approval, and Results & controls for one session; legacy
+  entry links to Home, Approval, and Experiment results for one session; legacy
   approval/control/session paths issue a 303 redirect. Direct and
   replacement lease requests must rebind the workflow's stable session.
 

@@ -150,7 +150,7 @@ class FullShutdownWebTests(unittest.TestCase):
                 service.autonomy_status(lease_id=lease_id)["status"], "paused"
             )
 
-    def test_results_resume_after_instrument_outage_keeps_active_controls(self) -> None:
+    def test_home_resume_after_instrument_outage_keeps_active_controls(self) -> None:
         with tempfile.TemporaryDirectory() as folder:
             service = AgentService(
                 make_settings(Path(folder), sample_state(0.2, 0.1))
@@ -209,13 +209,13 @@ class FullShutdownWebTests(unittest.TestCase):
             page = asyncio.run(
                 handle_session_dashboard(
                     _request(
-                        f"/session/{session_id}/results",
+                        f"/session/{session_id}/home",
                         {"session_id": session_id},
                         method="POST",
                         body=form,
                     ),
                     service,
-                    view="results",
+                    view="home",
                 )
             ).body.decode("utf-8")
 

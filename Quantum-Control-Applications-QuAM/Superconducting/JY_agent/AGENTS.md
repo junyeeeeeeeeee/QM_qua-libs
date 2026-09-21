@@ -75,8 +75,9 @@ automatic authorization`, and `緊急停止 JY worker` / `Emergency stop JY work
 to their corresponding server controls.
 
 The Dashboard may be local or a token-protected public HTTPS URL. Its stable `/`
-entry resolves the active session and links to three views: Home (status, device
-pairing, and full shutdown), Approval, and Results & controls. Every run remains
+entry resolves the active session and links to three views: Home (status,
+measurement controls, device pairing, and full shutdown), Approval, and
+Experiment results. Every run remains
 in the Results experiment-number dropdown until full service shutdown. Wait
 for the human to review scope, limits, prior result plots, Decision, Reason, next
 action, and payload, then type the exact confirmation on that page. The

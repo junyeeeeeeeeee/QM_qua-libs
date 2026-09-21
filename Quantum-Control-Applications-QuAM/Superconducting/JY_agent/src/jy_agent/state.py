@@ -157,6 +157,38 @@ def filter_patch(
     return allowed, rejected
 
 
+_QUBIT_POINTER = re.compile(r"^/qubits/(q[0-9]+)/")
+
+
+def patch_qubit_targets(patch: Iterable[dict[str, Any]]) -> set[str]:
+    """Return the qubit names a calibration state patch writes to."""
+
+    return {
+        match.group(1)
+        for item in patch
+        if (match := _QUBIT_POINTER.match(str(item.get("path", ""))))
+    }
+
+
+def split_patch_by_target(
+    patch: Iterable[dict[str, Any]], allowed: set[str]
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Split a patch into the entries owned by an allowed qubit and the rest.
+
+    A pointer that names no qubit is never "allowed": per-target evidence can
+    only authorize a per-target change.
+    """
+
+    kept: list[dict[str, Any]] = []
+    dropped: list[dict[str, Any]] = []
+    for item in patch:
+        match = _QUBIT_POINTER.match(str(item.get("path", "")))
+        (kept if match is not None and match.group(1) in allowed else dropped).append(
+            item
+        )
+    return kept, dropped
+
+
 def operation_backing_name(qubit: dict[str, Any], operation: str) -> str:
     operations = qubit["xy"]["operations"]
     entry = operations.get(operation)

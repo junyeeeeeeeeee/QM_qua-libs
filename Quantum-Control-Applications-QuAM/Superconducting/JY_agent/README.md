@@ -113,7 +113,7 @@ Enter either exact phrase in a project-loaded conversation. Do not append
 `target:` or `multiplex:`; a new workflow uses `state.json` `active_qubit_names`
 and defaults `multiplexed=true`. Conversational mode
 requires approval for every run or state change. Automatic mode requests one
-eight-hour bounded authorization and then continues only inside its targets,
+bounded authorization -- eight hours by default, specifiable at entry -- and then continues only inside its targets,
 nodes, safe parameters, and 20-attempt-per-node/qubit limit.
 The exact English entry commands are `Enter JY measurement mode` and
 `Enter JY automatic measurement mode`; see [Command.md](Command.md) for all
@@ -160,7 +160,7 @@ review-only Dashboard 透過 Cloudflare HTTPS quick tunnel 公開。Cloudflare �
 
 每次進入模式只對使用者顯示 entry result 最外層的 `browser_url`；這是手機與電腦
 共用的 `/` 首頁入口。首頁會解析目前 session，並提供三個分頁：首頁（狀態與
-完整關機）、核准、結果與控制。舊 `/approve/...`、`/autonomy/...` 與
+量測控制與完整關機）、核准、實驗結果。舊 `/approve/...`、`/autonomy/...` 與
 `/session/...` 連結只會導向對應的新分頁，不會建立另一個網站。直接建立或替換
 lease 也會重新綁定同一個 workflow session。
 
@@ -182,7 +182,7 @@ URL contains no secret; every browser enters the fixed ignored runtime password
 and receives an independent 12-hour secure cookie. The public surface cannot
 invoke MCP or arbitrary code. Agents show only the entry result's
 top-level `browser_url`, a common `/` entry for phones and computers. It resolves
-the active session and links to Home, Approval, and Results & controls. Legacy
+the active session and links to Home, Approval, and Experiment results. Legacy
 approval, autonomy, and session URLs redirect to the appropriate view. The
 Results selector retains every run for that server session; updates are
 event-driven. Language is selectable at the top right, and Prediction,

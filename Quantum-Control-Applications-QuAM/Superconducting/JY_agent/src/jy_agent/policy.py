@@ -199,6 +199,11 @@ class PolicyEngine:
             valid = value is None or (
                 isinstance(value, int) and not isinstance(value, bool)
             )
+        elif rule == "int":
+            # For a protected node that types the field as `int`. A fractional
+            # value crashes its Parameters model before any hardware runs; see
+            # the 2026-09-18 02c power-limit lesson.
+            valid = isinstance(value, int) and not isinstance(value, bool)
         elif rule == "bool":
             valid = isinstance(value, bool)
         elif rule == "number":
@@ -225,6 +230,8 @@ class PolicyEngine:
             valid = value in {"linear", "log"}
         elif rule == "log_lin_literal":
             valid = value in {"log", "lin"}
+        elif rule == "plot_dimension_literal":
+            valid = value in {"2D", "3D"}
         else:
             raise PolicyError(f"Unknown policy type rule {rule!r}")
         if not valid:
@@ -308,8 +315,24 @@ class PolicyEngine:
         if node_id == "03a":
             span_hz = float(parameters["frequency_span_in_mhz"]) * 1e6
             limit = float(self.limits["qubit_if_abs_hz"])
+            arbitrary_frequency = parameters.get("arbitrary_qubit_frequency_in_ghz")
             for name in qubits:
                 qubit = state["qubits"][name]
+                if arbitrary_frequency is not None:
+                    # 03a_Qubit_Spectroscopy.py computes
+                    # sqrt(detuning / freq_vs_flux_01_quad_term) for an
+                    # arbitrary center. That term is still zero until flux
+                    # spectroscopy has run, and the node raises
+                    # ZeroDivisionError mid-run; see the 2026-09-19 lesson.
+                    quad_term = qubit.get("freq_vs_flux_01_quad_term")
+                    if not is_finite_number(quad_term) or float(quad_term) == 0:
+                        raise PolicyError(
+                            f"{name} freq_vs_flux_01_quad_term is zero, so "
+                            "arbitrary_qubit_frequency_in_ghz would divide by "
+                            "zero inside the node; use "
+                            "jy_request_03a_candidate_center or "
+                            "jy_request_03a_window_shift to move the scan"
+                        )
                 current_if = qubit["xy"]["intermediate_frequency"]
                 if not is_finite_number(current_if):
                     raise PolicyError(f"{name} qubit IF is not numeric")

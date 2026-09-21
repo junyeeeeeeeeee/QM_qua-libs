@@ -4,8 +4,6 @@ param(
     [Parameter(Mandatory = $false)]
     [string]$Python = $env:JY_QUALIBRATE_PYTHON,
     [Parameter(Mandatory = $false)]
-    [string]$QualibrateConfig = $env:QUALIBRATE_CONFIG_FILE,
-    [Parameter(Mandatory = $false)]
     [string]$RunId,
     [switch]$InspectOnly
 )
@@ -49,12 +47,11 @@ if ($Action -eq "RecoverLock") {
     }
     & $TargetScript `
         -Python $Python `
-        -QualibrateConfig $QualibrateConfig `
         -RunId $RunId `
         -InspectOnly:$InspectOnly
 }
 elseif ($Action -ne "Stop") {
-    & $TargetScript -Python $Python -QualibrateConfig $QualibrateConfig
+    & $TargetScript -Python $Python
 }
 else {
     & $TargetScript

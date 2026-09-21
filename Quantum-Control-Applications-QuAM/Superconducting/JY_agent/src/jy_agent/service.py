@@ -18,7 +18,7 @@ from pathlib import Path
 from typing import Any, Callable, Collection
 from urllib.parse import urlsplit
 
-from .analysis import SnapshotAnalyzer
+from .analysis import AnalysisError, SnapshotAnalyzer, evidence_digest
 from .config import Settings
 from .db import Database
 from .policy import PolicyEngine, PolicyError
@@ -30,6 +30,8 @@ from .state import (
     filter_patch,
     json_diff,
     load_state,
+    operation_amplitude,
+    patch_qubit_targets,
     snapshot_state_path,
     StateError,
 )
@@ -97,6 +99,16 @@ def approval_operator_handoff() -> dict[str, str]:
 def instrument_operator_handoff() -> dict[str, str]:
     return operator_handoff(
         "現場檢查 QOP/OPX、儀器電源與實驗室網路，確認儀器可連線。",
+        "恢復量測",
+    )
+
+
+def submission_escalation_operator_handoff() -> dict[str, str]:
+    """Handoff for a single-target program the QOP still would not accept."""
+
+    return operator_handoff(
+        "單一 qubit 的程式仍送不進 QOP，且儀器有回應健康檢查，"
+        "請檢查 QOP 工作佇列或重啟 QOP。",
         "恢復量測",
     )
 
@@ -341,9 +353,17 @@ class AgentService:
         self,
         node_id: str | None = None,
         targets: list[str] | None = None,
-        limit: int = 50,
+        limit: int = 10,
+        include_analysis: bool = False,
     ) -> list[dict[str, Any]]:
-        """Expose every recorded scientific decision as reusable audit experience."""
+        """Expose recorded scientific decisions as reusable audit experience.
+
+        Operator instruction 2026-09-20: each entry used to carry the run's
+        whole analysis document, and the default asked for fifty of them, which
+        is far more context than choosing the next parameters needs. Each entry
+        now carries `evidence`, a per-target digest of the numbers the playbook
+        actually gates on. Pass `include_analysis=True` for the full document.
+        """
         if not isinstance(limit, int) or isinstance(limit, bool) or not 1 <= limit <= 200:
             raise ServiceError("limit must be between 1 and 200")
         query = (
@@ -364,29 +384,31 @@ class AgentService:
             run_targets = set(parameters.get("qubits", []))
             if requested and run_targets != requested:
                 continue
-            result.append(
-                {
-                    "decision_id": row["id"],
-                    "workflow_id": row["workflow_id"],
-                    "run_id": row["run_id"],
-                    "node_id": row["node_id"],
-                    "targets": sorted(run_targets),
-                    "parameters": parameters,
-                    "elapsed_seconds": _elapsed_seconds(row),
-                    "snapshot_id": row.get("snapshot_id"),
-                    "snapshot_path": row.get("snapshot_path"),
-                    "analysis_status": row.get("analysis_status"),
-                    "analysis": json_loads(row.get("analysis_json"), None),
-                    "Decision": row["decision"],
-                    "Reason": row["reason"],
-                    "next_action": {
-                        "next_node": row.get("next_node"),
-                        "new_parameters": json_loads(row["next_parameters_json"], {}),
-                    },
-                    "state_patch": json_loads(row["state_patch_json"], []),
-                    "created_at": row["created_at"],
-                }
-            )
+            analysis = json_loads(row.get("analysis_json"), None)
+            entry = {
+                "decision_id": row["id"],
+                "workflow_id": row["workflow_id"],
+                "run_id": row["run_id"],
+                "node_id": row["node_id"],
+                "targets": sorted(run_targets),
+                "parameters": parameters,
+                "elapsed_seconds": _elapsed_seconds(row),
+                "snapshot_id": row.get("snapshot_id"),
+                "snapshot_path": row.get("snapshot_path"),
+                "analysis_status": row.get("analysis_status"),
+                "evidence": evidence_digest(analysis),
+                "Decision": row["decision"],
+                "Reason": row["reason"],
+                "next_action": {
+                    "next_node": row.get("next_node"),
+                    "new_parameters": json_loads(row["next_parameters_json"], {}),
+                },
+                "state_patch": json_loads(row["state_patch_json"], []),
+                "created_at": row["created_at"],
+            }
+            if include_analysis:
+                entry["analysis"] = analysis
+            result.append(entry)
         return result
 
     def start_workflow(
@@ -478,6 +500,7 @@ class AgentService:
         reason: str,
         targets: list[str] | None = None,
         allowed_nodes: list[str] | None = None,
+        duration_hours: float | None = None,
     ) -> dict[str, Any]:
         """Create the one human approval that bounds unattended JY actions."""
         if not client_id.strip():
@@ -536,7 +559,7 @@ class AgentService:
                 "and start at the current node"
             )
         config = self.policy.raw["autonomy"]
-        duration_hours = float(config["duration_hours"])
+        duration_hours = self._resolve_autonomy_duration(duration_hours)
         max_total_runs = config.get("max_total_runs")
         max_attempts = int(config["max_attempts_per_node_qubit"])
         lease_id = uuid.uuid4().hex
@@ -718,13 +741,22 @@ class AgentService:
         targets: list[str] | None = None,
         *,
         multiplexed: bool | None = None,
+        duration_hours: float | None = None,
         reason: str = "Operator entered JY autonomous measurement mode.",
     ) -> dict[str, Any]:
-        """Start/resume a workflow and obtain its bounded autonomy lease."""
+        """Start/resume a workflow and obtain its bounded autonomy lease.
+
+        `duration_hours` sets this session's budget; omitting it uses the
+        configured default. It applies only when a new lease is created -- an
+        existing pending, active, or paused lease keeps the hours it was
+        approved with.
+        """
         if activation_phrase not in self.settings.autonomy_mode_entry_phrases:
             raise ServiceError(
                 "Entry requires the exact JY autonomous-measurement phrase"
             )
+        # Reject an out-of-policy budget before a workflow is created.
+        self._resolve_autonomy_duration(duration_hours)
         self._reject_retained_hardware_lock()
         workflow = self._enter_or_resume_workflow(
             client_id,
@@ -793,6 +825,7 @@ class AgentService:
             client_id,
             activation_phrase,
             reason or "Operator entered JY autonomous measurement mode.",
+            duration_hours=duration_hours,
         )
         result = {
             "workflow": workflow,
@@ -1535,14 +1568,35 @@ class AgentService:
             and node_id != workflow["current_node"]
             and self._is_active_reset_verification_node(workflow, node_id)
         )
+        advances_completed_node = (
+            not conversational
+            and not prerequisite_verification
+            and node_id != workflow["current_node"]
+            and self._node_is_finished_and_fully_decided(workflow, node_id)
+        )
         if (
             not conversational
             and node_id != workflow["current_node"]
             and not prerequisite_verification
+            and not advances_completed_node
         ):
             raise ServiceError(
                 f"Current workflow node is {workflow['current_node']}; record a decision first"
             )
+        if advances_completed_node:
+            previous_node = str(workflow["current_node"])
+            self.db.execute(
+                "UPDATE workflows SET current_node = ?, updated_at = ? "
+                "WHERE id = ? AND status = 'active'",
+                (node_id, utc_now(), workflow_id),
+            )
+            self.db.event(
+                "workflow_node_advanced_after_boundary",
+                client_id,
+                {"from_node": previous_node, "to_node": node_id},
+                workflow_id,
+            )
+            workflow = self._workflow(workflow_id)
         maximum_retries = int(
             self.policy.raw["approval"]["max_auto_retries_per_approval"]
         )
@@ -1571,12 +1625,15 @@ class AgentService:
         try:
             merged, warnings = self.policy.validate_run(node_id, parameters)
         except PolicyError as exc:
+            # Refused before anything reached the instrument, so the refusal is
+            # itself the protection. Record it and keep the lease usable; the
+            # agent corrects the parameter and proposes again.
             if autonomy_lease_id is not None:
-                self._halt_autonomy(
+                self._record_refused_autonomy_action(
                     autonomy_lease_id,
-                    f"Parameter policy violation: {exc}",
-                    "autonomy_guard",
-                    stop_active=True,
+                    workflow_id,
+                    "parameter_policy_violation",
+                    f"{node_id}: {exc}",
                 )
             raise
         if prerequisite_verification and not _is_active_reset(merged):
@@ -1612,10 +1669,13 @@ class AgentService:
                     "Run qubits must exactly match the workflow targets; start a "
                     "separate workflow for a different target set"
                 )
+            if not conversational and not prerequisite_verification:
+                self._validate_single_pass_node(workflow, node_id, merged)
             if (
                 workflow_parameters.get("multiplexed") is True
                 and not prerequisite_verification
             ):
+                self._validate_multiplex_cap(node_id, requested_targets)
                 self._validate_shared_parameter_first_batch(
                     workflow, node_id, requested_targets
                 )
@@ -1777,8 +1837,13 @@ class AgentService:
             except AutonomyQuotaError:
                 raise
             except AutonomyScopeError as exc:
-                self._halt_autonomy(
-                    str(lease_id), str(exc), "autonomy_guard", stop_active=True
+                # Same rule as `start_authorized_run`: the run is refused before
+                # the worker launches, so the lease stays usable.
+                self._record_refused_autonomy_action(
+                    str(lease_id),
+                    proposal["workflow_id"],
+                    "autonomy_scope",
+                    str(exc),
                 )
                 raise
         try:
@@ -1827,6 +1892,12 @@ class AgentService:
         decoded = self._decode_run(run)
         if self._is_instrument_connectivity_failure(run):
             decoded["operator_handoff"] = instrument_operator_handoff()
+        else:
+            submission = self._program_submission_timeout(run)
+            if submission is not None and submission.get("measurement_paused"):
+                decoded["operator_handoff"] = (
+                    submission_escalation_operator_handoff()
+                )
         return decoded
 
     def stop_run(self, run_id: str, client_id: str) -> dict[str, Any]:
@@ -1862,16 +1933,50 @@ class AgentService:
         if run is None or run.get("autonomy_lease_id") != lease_id:
             raise ServiceError("Run is not associated with this autonomy lease")
         self._active_autonomy(lease_id, run["workflow_id"])
+        if run["status"] != "completed":
+            # Refuse a premature analyze before the watchdog runs. Enforcing
+            # hardware-anomaly rules as a side effect of a timing mistake used
+            # to end the lease over a call that did nothing.
+            self._record_refused_autonomy_action(
+                lease_id,
+                run["workflow_id"],
+                "analysis_precondition",
+                f"Run {run_id} is {run['status']}, not completed",
+            )
+            raise ServiceError(
+                f"Only a completed run can be analyzed; run {run_id} is "
+                f"{run['status']}"
+            )
         self._enforce_run_hard_stops(run)
         try:
             return self.analyze_run(run_id)
-        except Exception as exc:
-            self._halt_autonomy(
-                lease_id,
-                f"Snapshot analysis raised an exception: {exc}",
-                client_id,
-                stop_active=False,
+        except ServiceError as exc:
+            # A precondition the agent got wrong -- most often analyzing a run
+            # that has not reached a terminal state yet. Nothing was consumed,
+            # so refuse it and let the agent wait and call again.
+            self._record_refused_autonomy_action(
+                lease_id, run["workflow_id"], "analysis_precondition", str(exc)
             )
+            raise
+        except Exception as exc:
+            # An unreadable or unusable snapshot is the configured
+            # `snapshot_missing` hard stop; anything else is an unknown
+            # analyzer failure, which pauses for the operator.
+            if isinstance(exc, AnalysisError):
+                self._halt_autonomy(
+                    lease_id,
+                    f"Snapshot analysis could not read run {run_id}: {exc}",
+                    client_id,
+                    stop_active=False,
+                )
+            else:
+                self._pause_autonomy_for_review(
+                    run,
+                    f"Snapshot analysis raised an unexpected exception for run "
+                    f"{run_id}: {exc}",
+                    "autonomy_paused_for_analysis_failure",
+                    client_id,
+                )
             raise
 
     def record_decision(
@@ -2171,12 +2276,14 @@ class AgentService:
         try:
             self.policy.validate_state_patch(patch)
         except PolicyError as exc:
+            # The patch is rejected before any proposal exists, so `state.json`
+            # is untouched. Refuse and keep the lease.
             if autonomy_lease_id is not None:
-                self._halt_autonomy(
+                self._record_refused_autonomy_action(
                     autonomy_lease_id,
-                    f"Parameter policy violation in state patch: {exc}",
-                    "autonomy_guard",
-                    stop_active=True,
+                    workflow_id,
+                    "state_patch_policy_violation",
+                    str(exc),
                 )
             raise
         workflow_targets = set(json_loads(workflow["targets_json"], []))
@@ -2204,11 +2311,12 @@ class AgentService:
                         autonomy_lease, run_id, patch
                     )
             except AutonomyScopeError as exc:
-                self._halt_autonomy(
+                # Out-of-scope commit, refused before the proposal is created.
+                self._record_refused_autonomy_action(
                     autonomy_lease_id,
+                    workflow_id,
+                    "state_commit_scope",
                     str(exc),
-                    "autonomy_guard",
-                    stop_active=True,
                 )
                 raise
         payload = {
@@ -2261,12 +2369,17 @@ class AgentService:
             )
             result = self.apply_state_commit(proposal["id"], client_id)
             return {**result, "lease_id": lease_id}
-        except AutonomyEvidenceError:
+        except (AutonomyEvidenceError, AutonomyScopeError, PolicyError):
+            # Refused before `state.json` was written; the inner layer has
+            # already recorded it and the lease stays usable.
             raise
-        except (PolicyError, StateError, AutonomyScopeError, ValueError) as exc:
+        except (StateError, ValueError) as exc:
+            # A conflict while applying: the state file may no longer match what
+            # the evidence was derived from. `apply_state_commit` halts on its
+            # own for a claimed proposal; halt here for the rest.
             self._halt_autonomy(
                 lease_id,
-                f"Authorized state commit was refused or conflicted: {exc}",
+                f"Authorized state commit conflicted while applying: {exc}",
                 "autonomy_guard",
                 stop_active=True,
             )
@@ -2294,7 +2407,16 @@ class AgentService:
         try:
             result = self.apply_state_commit(proposal_id, client_id)
             return {**result, "lease_id": lease_id}
+        except (PolicyError, AutonomyScopeError, AutonomyEvidenceError) as exc:
+            self._record_refused_autonomy_action(
+                lease_id,
+                proposal["workflow_id"],
+                "deterministic_setup_refused",
+                str(exc),
+            )
+            raise
         except Exception as exc:
+            # Anything else here means the write itself failed or conflicted.
             self._halt_autonomy(
                 lease_id,
                 f"Authorized setup commit failed: {exc}",
@@ -2541,11 +2663,13 @@ class AgentService:
             self.policy.validate_state_patch(patch, state)
         except (PolicyError, ValueError) as exc:
             if autonomy_lease_id:
-                self._halt_autonomy(
+                # Refused before the setup proposal exists; nothing was
+                # written, so the lease stays usable.
+                self._record_refused_autonomy_action(
                     autonomy_lease_id,
-                    f"Parameter policy violation in LO recenter setup: {exc}",
-                    "autonomy_guard",
-                    stop_active=True,
+                    workflow_id,
+                    "deterministic_setup_policy_violation",
+                    f"LO recenter setup: {exc}",
                 )
             raise ServiceError(str(exc)) from exc
         payload = {
@@ -2625,11 +2749,13 @@ class AgentService:
             self.policy.validate_state_patch(patch, state)
         except (PolicyError, ValueError) as exc:
             if autonomy_lease_id:
-                self._halt_autonomy(
+                # Refused before the setup proposal exists; nothing was
+                # written, so the lease stays usable.
+                self._record_refused_autonomy_action(
                     autonomy_lease_id,
-                    f"Parameter policy violation in initial 03a setup: {exc}",
-                    "autonomy_guard",
-                    stop_active=True,
+                    workflow_id,
+                    "deterministic_setup_policy_violation",
+                    f"initial 03a setup: {exc}",
                 )
             raise ServiceError(str(exc)) from exc
         payload = {
@@ -2707,11 +2833,13 @@ class AgentService:
             self.policy.validate_state_patch(patch, state)
         except (PolicyError, ValueError) as exc:
             if autonomy_lease_id:
-                self._halt_autonomy(
+                # Refused before the setup proposal exists; nothing was
+                # written, so the lease stays usable.
+                self._record_refused_autonomy_action(
                     autonomy_lease_id,
-                    f"Parameter policy violation in 03a window shift: {exc}",
-                    "autonomy_guard",
-                    stop_active=True,
+                    workflow_id,
+                    "deterministic_setup_policy_violation",
+                    f"03a window shift: {exc}",
                 )
             raise ServiceError(str(exc)) from exc
         payload = {
@@ -2824,11 +2952,13 @@ class AgentService:
             self.policy.validate_state_patch(patch, state)
         except (PolicyError, ValueError) as exc:
             if autonomy_lease_id:
-                self._halt_autonomy(
+                # Refused before the setup proposal exists; nothing was
+                # written, so the lease stays usable.
+                self._record_refused_autonomy_action(
                     autonomy_lease_id,
-                    f"Parameter policy violation in 03a candidate center: {exc}",
-                    "autonomy_guard",
-                    stop_active=True,
+                    workflow_id,
+                    "deterministic_setup_policy_violation",
+                    f"03a candidate center: {exc}",
                 )
             raise ServiceError(str(exc)) from exc
         for name, item in details.items():
@@ -3564,17 +3694,356 @@ class AgentService:
             }
         )
 
+    #: Nodes whose playbook recovery for a noisy-but-interior trace is the
+    #: configured averaging ladder rather than a new window or power.
+    SNR_LADDER_NODES = ("03a", "04", "05")
+
+    def next_action(self, workflow_id: str) -> dict[str, Any]:
+        """Say deterministically what the workflow needs next, and why.
+
+        This is an aggregator, not a second opinion: every field comes from the
+        same server state the guards already enforce -- current node, per-target
+        resolution, attempt quota, the shared-first-batch rule, the registered
+        deterministic setup tools, and the configured averaging ladder. When no
+        registered rule covers the situation it says so and cites the playbook
+        section to read, rather than inventing a parameter.
+        """
+
+        workflow = self._workflow(workflow_id)
+        node_id = str(workflow["current_node"])
+        sequence = list(self.settings.workflow_sequence)
+        active = self._active_targets_for_node(workflow, node_id)
+        resolved = self._node_target_resolution(workflow_id, node_id) & active
+        incomplete = self._autonomy_incomplete_targets_for_node(workflow_id, node_id)
+        unresolved = active - resolved - incomplete
+        index = sequence.index(node_id) if node_id in sequence else -1
+        next_node = sequence[index + 1] if 0 <= index < len(sequence) - 1 else None
+        latest = self.db.one(
+            "SELECT r.*, d.id AS decision_id FROM runs r "
+            "LEFT JOIN decisions d ON d.run_id = r.id "
+            "WHERE r.workflow_id = ? AND r.node_id = ? ORDER BY r.rowid DESC LIMIT 1",
+            (workflow_id, node_id),
+        )
+        result: dict[str, Any] = {
+            "workflow_id": workflow_id,
+            "workflow_status": workflow["status"],
+            "current_node": node_id,
+            "next_node_in_sequence": next_node,
+            "targets": {
+                "active": sorted(active),
+                "resolved": sorted(resolved),
+                "incomplete": sorted(incomplete),
+                "unresolved": sorted(unresolved),
+            },
+            "latest_run": (
+                {
+                    "run_id": latest["id"],
+                    "status": latest["status"],
+                    "analysis_status": latest.get("analysis_status"),
+                    "parameters": json_loads(latest.get("parameters_json"), {}),
+                    "has_decision": latest.get("decision_id") is not None,
+                    "evidence": evidence_digest(
+                        json_loads(latest.get("analysis_json"), None)
+                    ),
+                }
+                if latest is not None
+                else None
+            ),
+            "rules": [],
+            "required_setup": [],
+            "notes": [],
+        }
+        result["attempts"] = self._attempts_for_node(workflow_id, node_id, active)
+
+        if workflow["status"] != "active":
+            result["action"] = "blocked"
+            result["reason"] = (
+                f"The workflow is {workflow['status']}; resume it before scheduling."
+            )
+            return result
+        if latest is not None and latest["status"] in {
+            "starting",
+            "running",
+            "stopping",
+        }:
+            result["action"] = "wait"
+            result["reason"] = (
+                f"Run {latest['id']} is {latest['status']}. Wait for a terminal "
+                "status before analyzing."
+            )
+            return result
+        if (
+            latest is not None
+            and latest["status"] == "completed"
+            and latest.get("analysis_status")
+            not in {"pass", "needs_review", "failed"}
+        ):
+            # `analysis_status` defaults to 'not_started', so test the three
+            # analyzed values rather than NULL.
+            result["action"] = "analyze"
+            result["reason"] = f"Run {latest['id']} completed and is not analyzed yet."
+            return result
+        if latest is not None and not latest.get("decision_id"):
+            result["action"] = "record_decision"
+            result["reason"] = (
+                f"Run {latest['id']} has no recorded decision. A node cannot be "
+                "left without one; see 'Record `advance`, not `manual_review`, "
+                "on the run that finishes a node'."
+            )
+            result["rules"].append(
+                "PLAYBOOK: Record `advance`, not `manual_review`, on the run "
+                "that finishes a node"
+            )
+            return result
+
+        single_pass_done = self._node_is_single_pass(node_id) and not (
+            active - self._single_pass_measured_targets(workflow, node_id)
+        ) and self._node_has_completed_run(workflow_id, node_id)
+        if single_pass_done:
+            repeat_targets = self._active_reset_repeat_targets(workflow)
+            if repeat_targets and self._is_active_reset_repeat(
+                workflow, node_id, {"reset_type_thermal_or_active": "active"}
+            ):
+                batch = sorted(repeat_targets)
+                result["action"] = "run"
+                result["run"] = {
+                    "node_id": node_id,
+                    "qubits": batch,
+                    "parameters": {
+                        "qubits": batch,
+                        "reset_type_thermal_or_active": "active",
+                    },
+                }
+                result["reason"] = (
+                    f"{len(batch)} target(s) cleared the active-reset trigger "
+                    "fidelity on the thermal run, so repeat 07b once with "
+                    "active reset. That repeat is their accepted result and "
+                    "qualifies them to use active reset downstream."
+                )
+                result["rules"].append(
+                    "PLAYBOOK: 07d and 07b run once on defaults"
+                )
+                return result
+            result["action"] = "advance"
+            result["reason"] = (
+                f"{node_id} runs once on the node defaults and then advances. "
+                "Its run is complete and analyzed, so record `advance` and move "
+                "to the next node; do not retry or adjust parameters."
+            )
+            result["rules"].append(
+                "PLAYBOOK: 07d and 07b run once on defaults"
+            )
+            result["run"] = None
+            return result
+
+        result["required_setup"] = self._required_setup_for_node(
+            node_id, sorted(active), workflow_id
+        )
+        if result["required_setup"]:
+            result["action"] = "setup"
+            result["reason"] = (
+                "A registered deterministic setup must be applied before this "
+                "node can run."
+            )
+            return result
+
+        if not unresolved:
+            result["action"] = "advance"
+            result["reason"] = (
+                f"Every active {node_id} target is resolved or incomplete at its "
+                "scientific boundary."
+                if incomplete
+                else f"Every active {node_id} target is resolved."
+            )
+            result["run"] = None
+            return result
+
+        cap = self._node_multiplex_cap(node_id)
+        first_batch = node_id in SHARED_FIRST_BATCH_NODES and not (
+            self._node_has_completed_run(workflow_id, node_id)
+        )
+        if first_batch and not (cap is not None and len(active) > cap):
+            result["action"] = "run"
+            result["run"] = {
+                "node_id": node_id,
+                "qubits": sorted(active),
+                "parameters": {"qubits": sorted(active)},
+            }
+            result["reason"] = (
+                f"The first {node_id} run must multiplex every active target "
+                "with one shared parameter set; node defaults apply to the rest."
+            )
+            result["rules"].append("PLAYBOOK: Multiplex workflows")
+            return result
+
+        batch = sorted(unresolved)
+        capped = cap is not None and len(batch) > cap
+        if capped:
+            batch = batch[:cap]
+        result["action"] = "run"
+        result["run"] = {
+            "node_id": node_id,
+            "qubits": batch,
+            "parameters": {"qubits": batch},
+        }
+        result["reason"] = (
+            f"{node_id} multiplexes at most {cap} targets per run; take the "
+            f"next group of {len(batch)} and repeat the node for the rest."
+            if capped
+            else f"Retry the unresolved {node_id} targets together; omit the "
+            "resolved ones."
+        )
+        result["rules"].append("PLAYBOOK: Multiplex workflows")
+        ladder = self._ladder_recommendation(latest, node_id, unresolved)
+        if ladder is not None:
+            result["run"]["parameters"] = ladder["parameters"]
+            result["run"]["qubits"] = ladder["parameters"]["qubits"]
+            result["reason"] = ladder["reason"]
+            result["rules"].append(ladder["rule"])
+        else:
+            result["notes"].append(
+                "No registered deterministic parameter change covers this "
+                f"situation. Read the '{node_id}' section of the playbook and "
+                f"`rules/experiences/{node_id}.md` before choosing parameters."
+            )
+        return result
+
+    def _attempts_for_node(
+        self, workflow_id: str, node_id: str, targets: Collection[str]
+    ) -> dict[str, Any]:
+        """Per-target attempts used and left under the current lease."""
+
+        lease = self.db.one(
+            "SELECT * FROM autonomy_leases WHERE workflow_id = ? "
+            "AND status IN ('active', 'paused') ORDER BY created_at DESC LIMIT 1",
+            (workflow_id,),
+        )
+        if lease is None:
+            return {"lease_id": None, "used": {}, "remaining": {}, "maximum": None}
+        maximum = int(lease["max_attempts_per_node_qubit"])
+        used = {str(name): 0 for name in targets}
+        for run in self.db.all(
+            "SELECT parameters_json FROM runs WHERE autonomy_lease_id = ? "
+            "AND node_id = ?",
+            (lease["id"], node_id),
+        ):
+            prior = set(json_loads(run.get("parameters_json"), {}).get("qubits", []))
+            for name in used:
+                if name in prior:
+                    used[name] += 1
+        return {
+            "lease_id": lease["id"],
+            "maximum": maximum,
+            "used": used,
+            "remaining": {
+                name: max(0, maximum - count) for name, count in used.items()
+            },
+        }
+
+    def _required_setup_for_node(
+        self, node_id: str, targets: list[str], workflow_id: str
+    ) -> list[dict[str, str]]:
+        """The deterministic setup tools the playbook requires before a node."""
+
+        required: list[dict[str, str]] = []
+        try:
+            state = load_state(self.settings.active_state)
+        except Exception:
+            return required
+        qubits = state.get("qubits", {}) if isinstance(state, dict) else {}
+        if node_id in {"03a", "04", "05"}:
+            missing_x180 = [
+                name
+                for name in targets
+                if isinstance(qubits.get(name), dict)
+                and operation_amplitude(qubits[name], "x180") == 0
+            ]
+            if missing_x180:
+                required.append(
+                    {
+                        "tool": "jy_request_bootstrap",
+                        "targets": ", ".join(missing_x180),
+                        "why": (
+                            "x180 amplitude is zero; 03a/04/05 cannot drive the "
+                            "qubit until bootstrap is applied."
+                        ),
+                    }
+                )
+        if node_id == "03a" and not self._node_has_completed_run(workflow_id, "03a"):
+            required.append(
+                {
+                    "tool": "jy_request_initial_03a_zero_if",
+                    "targets": ", ".join(targets),
+                    "why": (
+                        "The first 03a coarse search requires every target's "
+                        "private LO on its RF with XY IF at zero."
+                    ),
+                }
+            )
+        if node_id == "07b":
+            missing_fidelity = [
+                name
+                for name in targets
+                if "readout_fidelity"
+                not in (qubits.get(name, {}).get("extras", {}) or {})
+            ]
+            if missing_fidelity:
+                required.append(
+                    {
+                        "tool": "jy_request_07b_prerequisites",
+                        "targets": ", ".join(missing_fidelity),
+                        "why": (
+                            "extras/readout_fidelity is missing, so Qualibrate's "
+                            "state recorder cannot observe an old value."
+                        ),
+                    }
+                )
+        return required
+
+    def _ladder_recommendation(
+        self, latest: dict[str, Any] | None, node_id: str, unresolved: set[str]
+    ) -> dict[str, Any] | None:
+        """The configured averaging ladder, when it applies to this retry."""
+
+        if latest is None or node_id not in self.SNR_LADDER_NODES:
+            return None
+        if latest["status"] != "completed" or not latest.get("analysis_json"):
+            return None
+        try:
+            guidance = self.snr_retry_recommendation(str(latest["id"]))
+        except ServiceError:
+            return None
+        if not guidance.get("retry_recommended"):
+            return None
+        low_snr = set(guidance.get("low_snr_targets", []))
+        if not low_snr or not low_snr <= unresolved:
+            return None
+        parameters = dict(guidance["retry_parameters"])
+        parameters["qubits"] = sorted(low_snr)
+        return {
+            "parameters": parameters,
+            "reason": guidance["reason"],
+            "rule": (
+                f"policies.yaml analysis.{node_id}.noise_confirmation_num_averages"
+            ),
+        }
+
     def snr_retry_recommendation(self, run_id: str) -> dict[str, Any]:
-        """Recommend the next safe averaging step for a noisy 04/05 result."""
+        """Recommend the next safe averaging step for a noisy 03a/04/05 result."""
         run = self.db.one("SELECT * FROM runs WHERE id = ?", (run_id,))
         if run is None:
             raise ServiceError(f"Unknown run: {run_id}")
         node_id = str(run["node_id"])
-        if node_id not in {"04", "05"}:
-            raise ServiceError("SNR retry guidance is available only for nodes 04 and 05")
+        if node_id not in self.SNR_LADDER_NODES:
+            raise ServiceError(
+                "SNR retry guidance is available only for nodes "
+                f"{', '.join(self.SNR_LADDER_NODES)}"
+            )
         analysis = json_loads(run.get("analysis_json"), {})
         if run["status"] != "completed" or not analysis:
-            raise ServiceError("Analyze a completed 04/05 run before requesting guidance")
+            raise ServiceError(
+                f"Analyze a completed {node_id} run before requesting guidance"
+            )
         parameters = json_loads(run.get("parameters_json"), {})
         rules = self.policy.raw["analysis"][node_id]
         minimum = float(rules["min_robust_snr"])
@@ -3679,6 +4148,10 @@ class AgentService:
                 "snapshot_id": run.get("snapshot_id"),
                 "snapshot_path": run.get("snapshot_path"),
                 "analysis_status": run.get("analysis_status"),
+                # The Dashboard has no policy access, so tell it whether this
+                # node is one that runs once on defaults; its result summary
+                # must not report such a run as unsuccessful.
+                "single_pass": self._node_is_single_pass(str(run["node_id"])),
             },
             "analysis": analysis,
             "decision": decision,
@@ -4740,18 +5213,53 @@ class AgentService:
         self, lease: dict[str, Any], patch: list[dict[str, Any]]
     ) -> None:
         allowed_targets = set(json_loads(lease["targets_json"], []))
-        patch_targets = {
-            match.group(1)
-            for item in patch
-            if (
-                match := re.fullmatch(
-                    r"/qubits/(q[0-9]+)/.*", str(item.get("path", ""))
-                )
-            )
-        }
+        patch_targets = patch_qubit_targets(patch)
         if not patch_targets or not patch_targets.issubset(allowed_targets):
             raise AutonomyScopeError(
                 "State patch targets are outside the autonomy lease; new approval is required"
+            )
+
+    def _assert_partial_pass_state_commit(
+        self,
+        run: dict[str, Any],
+        patch: list[dict[str, Any]],
+        allowed_statuses: set[str],
+    ) -> None:
+        """Allow a `needs_review` run to commit only its passing targets.
+
+        Operator instruction 2026-09-20. Suppressing the whole patch lost
+        calibrated values permanently: the node refuses a further run once every
+        target is resolved, so a qubit that passed inside a `needs_review` run
+        had no remaining way to obtain a pass-backed commit.
+        """
+
+        refusal = AutonomyEvidenceError(
+            "Autonomous state commit requires a completed run with an allowed "
+            f"analysis status: {sorted(allowed_statuses)}"
+        )
+        if not bool(
+            self.policy.raw["autonomy"].get("partial_pass_state_commit", False)
+        ):
+            raise refusal
+        if run["analysis_status"] != "needs_review":
+            raise refusal
+        analysis = json_loads(run.get("analysis_json"), {})
+        if not isinstance(analysis, dict) or "passing_targets" not in analysis:
+            raise AutonomyEvidenceError(
+                "This run was analyzed before per-target evidence was recorded; "
+                "re-analyze it before committing a partial-pass state patch"
+            )
+        passing = {str(name) for name in analysis.get("passing_targets", [])}
+        patch_targets = patch_qubit_targets(patch)
+        if not patch_targets:
+            raise AutonomyEvidenceError(
+                "A needs_review run may commit only per-qubit calibration values"
+            )
+        outside = sorted(patch_targets - passing)
+        if outside:
+            raise AutonomyEvidenceError(
+                f"{outside} did not pass every check in this needs_review run; "
+                f"only {sorted(passing)} may be committed from it"
             )
 
     def _validate_autonomous_scientific_state_commit(
@@ -4780,11 +5288,12 @@ class AgentService:
         allowed_statuses = set(
             json_loads(lease["auto_state_commit_statuses_json"], [])
         )
-        if run["status"] != "completed" or run["analysis_status"] not in allowed_statuses:
+        if run["status"] != "completed":
             raise AutonomyEvidenceError(
-                "Autonomous state commit requires a completed run with an allowed "
-                f"analysis status: {sorted(allowed_statuses)}"
+                "Autonomous state commit requires a completed run"
             )
+        if run["analysis_status"] not in allowed_statuses:
+            self._assert_partial_pass_state_commit(run, patch, allowed_statuses)
         decision = self.db.one(
             "SELECT * FROM decisions WHERE run_id = ? ORDER BY created_at DESC LIMIT 1",
             (run_id,),
@@ -4984,11 +5493,24 @@ class AgentService:
 
     @staticmethod
     def _is_recoverable_scheduling_block(exc: BaseException) -> bool:
+        """True when the refusal happened before the worker reached hardware.
+
+        Operator instruction 2026-09-20: this used to compare three exact
+        message strings, so rewording any one of them silently turned a
+        recoverable refusal into a lease-ending halt. Scope, quota, and policy
+        refusals are now recognized by type, and the remaining message tests
+        only cover the paused/stopped-workflow wording.
+        """
+
+        if isinstance(
+            exc, (AutonomyScopeError, AutonomyQuotaError, PolicyError)
+        ):
+            return True
         message = str(exc)
         return (
             "; new actions are blocked" in message
             or message == "Workflow is not active"
-            or message.startswith("Resume measurement mode before executing")
+            or message.startswith("Resume measurement mode before")
         )
 
     @staticmethod
@@ -4998,15 +5520,39 @@ class AgentService:
         analysis = json_loads(run.get("analysis_json"), {})
         return analysis.get("failure_category") == "instrument_unreachable"
 
-    def _instrument_outage_already_resumed(self, run: dict[str, Any]) -> bool:
-        """Skip re-pausing an outage the operator has already resumed past."""
+    @staticmethod
+    def _program_submission_timeout(run: dict[str, Any]) -> dict[str, Any] | None:
+        """Return the analysis of a probe-confirmed submission timeout.
+
+        The worker records this category only after the QOP answered a health
+        check, so it is a program-size failure and not an outage.
+        """
+
+        analysis = json_loads(run.get("analysis_json"), {})
+        cause = str(run.get("termination_cause") or "")
+        if (
+            cause == "program_submission_timeout"
+            or analysis.get("failure_category") == "program_submission_timeout"
+        ):
+            return analysis if isinstance(analysis, dict) else {}
+        return None
+
+    def _pause_already_resumed(
+        self, run: dict[str, Any], event_type: str
+    ) -> bool:
+        """Skip re-pausing a failure the operator has already resumed past.
+
+        The watchdog re-examines the same failed run on every sweep, so
+        without this the resume is undone in the same second it is granted and
+        `恢復量測` can never take effect.
+        """
 
         pause = self.db.one(
             "SELECT created_at FROM events "
-            "WHERE workflow_id = ? AND event_type = 'measurement_paused_for_instrument_error' "
+            "WHERE workflow_id = ? AND event_type = ? "
             "AND json_extract(payload_json, '$.run_id') = ? "
             "ORDER BY created_at DESC LIMIT 1",
-            (run["workflow_id"], run["id"]),
+            (run["workflow_id"], event_type, run["id"]),
         )
         if pause is None:
             return False
@@ -5020,6 +5566,13 @@ class AgentService:
         )
         return resume is not None
 
+    def _instrument_outage_already_resumed(self, run: dict[str, Any]) -> bool:
+        """Skip re-pausing an outage the operator has already resumed past."""
+
+        return self._pause_already_resumed(
+            run, "measurement_paused_for_instrument_error"
+        )
+
     def _pause_for_instrument_connectivity(
         self, run: dict[str, Any]
     ) -> None:
@@ -5029,11 +5582,118 @@ class AgentService:
             return
         if self._instrument_outage_already_resumed(run):
             return
-        now = utc_now()
-        reason = (
+        self._pause_autonomy_for_review(
+            run,
             f"Instrument connectivity error paused run {run['id']}; no new "
-            "experiment will be scheduled until the operator resumes."
+            "experiment will be scheduled until the operator resumes.",
+            "measurement_paused_for_instrument_error",
+            "instrument_failure_guard",
         )
+
+    def _resolve_autonomy_duration(self, requested: float | None) -> float:
+        """Clamp-check an entry-supplied lease budget against policy.
+
+        Operator instruction 2026-09-20: automatic-mode entry may name the hours
+        for that session instead of always taking the configured default. The
+        human still approves the number shown on the Dashboard.
+        """
+
+        config = self.policy.raw["autonomy"]
+        default_hours = float(config["duration_hours"])
+        if requested is None:
+            return default_hours
+        if isinstance(requested, bool) or not isinstance(requested, (int, float)):
+            raise ServiceError("duration_hours must be a number of hours")
+        hours = float(requested)
+        maximum = float(config.get("max_duration_hours", default_hours))
+        if not math.isfinite(hours) or hours <= 0:
+            raise ServiceError("duration_hours must be a positive number of hours")
+        if hours > maximum:
+            raise ServiceError(
+                f"duration_hours {hours:g} exceeds the policy maximum of "
+                f"{maximum:g} hours"
+            )
+        return hours
+
+    def _record_refused_autonomy_action(
+        self,
+        lease_id: str,
+        workflow_id: str,
+        category: str,
+        detail: str,
+    ) -> None:
+        """Audit an in-scope action that was refused before it reached hardware.
+
+        Operator instruction 2026-09-20. Refusing the action is the protection;
+        ending the lease on top of that only costs a new human approval and
+        stops a bring-up that could have continued. The refusal stays visible on
+        the Dashboard and in the audit log.
+        """
+
+        self.db.event(
+            "autonomy_action_refused",
+            "autonomy_guard",
+            {"lease_id": lease_id, "category": category, "detail": detail},
+            workflow_id,
+        )
+
+    def recoverable_worker_exception(
+        self, run: dict[str, Any]
+    ) -> dict[str, Any] | None:
+        """Match a worker crash against the registered recoverable signatures.
+
+        Operator instruction 2026-09-20: a crash that is a parameter the
+        protected node itself rejects is deterministic and correctable, so it
+        leaves the lease usable. Everything unrecognized pauses for a human.
+        """
+
+        traceback_text = str(run.get("error") or "")
+        if not traceback_text:
+            return None
+        node_id = str(run.get("node_id") or "")
+        parameters = json_loads(run.get("parameters_json"), {})
+        parameter_names = set(parameters) if isinstance(parameters, dict) else set()
+        folded = traceback_text.casefold()
+        signatures = self.policy.raw["autonomy"].get(
+            "recoverable_worker_exceptions", []
+        )
+        for signature in signatures if isinstance(signatures, list) else []:
+            if not isinstance(signature, dict):
+                continue
+            nodes = signature.get("nodes") or []
+            if nodes and node_id not in {str(item) for item in nodes}:
+                continue
+            types = [str(item).casefold() for item in signature.get("exception_types", [])]
+            if types and not any(f"{item}:" in folded or f"{item} " in folded for item in types):
+                continue
+            markers = [str(item).casefold() for item in signature.get("message_markers", [])]
+            if markers and not any(marker in folded for marker in markers):
+                continue
+            required = {str(item) for item in signature.get("parameters", [])}
+            if required and not (required & parameter_names):
+                continue
+            return {
+                "id": str(signature.get("id") or "unnamed_signature"),
+                "remedy": str(signature.get("remedy") or "").strip(),
+                "parameters": sorted(required & parameter_names),
+            }
+        return None
+
+    def _pause_autonomy_for_review(
+        self,
+        run: dict[str, Any],
+        reason: str,
+        event_type: str,
+        actor: str,
+        detail: dict[str, Any] | None = None,
+    ) -> None:
+        """Pause the lease and scheduling without ending the authorization.
+
+        The operator inspects the Dashboard and resumes the same lease with
+        `恢復量測`; no new human approval is needed.
+        """
+
+        now = utc_now()
         with self.db.transaction(immediate=True) as connection:
             changed = 0
             lease_id = run.get("autonomy_lease_id")
@@ -5056,12 +5716,13 @@ class AgentService:
             ).rowcount
             if changed:
                 self.db.event(
-                    "measurement_paused_for_instrument_error",
-                    "instrument_failure_guard",
+                    event_type,
+                    actor,
                     {
                         "run_id": run["id"],
                         "reason": reason,
                         "hardware_lock_retained": self.settings.lock_path.exists(),
+                        **(detail or {}),
                     },
                     run["workflow_id"],
                     connection=connection,
@@ -5080,11 +5741,63 @@ class AgentService:
             if self._is_instrument_connectivity_failure(run):
                 self._pause_for_instrument_connectivity(run)
                 return
-            self._halt_autonomy(
-                str(lease_id),
-                f"Worker failure for run {run['id']}: {run.get('error') or run['status']}",
+            submission = self._program_submission_timeout(run)
+            if submission is not None:
+                # A live probe answered after the timeout, so the instrument is
+                # healthy and the program was simply too large to submit. The
+                # remedy is a smaller multiplex group, which the agent can do
+                # without an operator, so the lease stays active. The worker
+                # already paused if a single target had left no room to halve.
+                if not submission.get("measurement_paused"):
+                    self.db.event(
+                        "autonomy_program_submission_timeout",
+                        "autonomy_watchdog",
+                        {
+                            "run_id": run["id"],
+                            "attempted_target_count": submission.get(
+                                "attempted_target_count"
+                            ),
+                            "instrument_probe": submission.get(
+                                "instrument_probe"
+                            ),
+                            "remedy": (
+                                "Halve the multiplex group and repeat the node."
+                            ),
+                        },
+                        run["workflow_id"],
+                    )
+                return
+            recoverable = self.recoverable_worker_exception(run)
+            if recoverable is not None:
+                # Registered node-parameter rejection: nothing ran, the cause is
+                # known, and the remedy is a different parameter. Keep the lease.
+                self.db.event(
+                    "autonomy_recoverable_worker_exception",
+                    "autonomy_watchdog",
+                    {
+                        "run_id": run["id"],
+                        "signature": recoverable["id"],
+                        "parameters": recoverable["parameters"],
+                        "remedy": recoverable["remedy"],
+                    },
+                    run["workflow_id"],
+                )
+                return
+            if self._pause_already_resumed(
+                run, "autonomy_paused_for_worker_failure"
+            ):
+                # The operator has seen this failure and resumed past it.
+                # Re-pausing here would undo the resume on the next sweep and
+                # leave the lease permanently stuck.
+                return
+            self._pause_autonomy_for_review(
+                run,
+                f"Unrecognized worker failure for run {run['id']} paused "
+                "scheduling for operator review: "
+                f"{run.get('error') or run['status']}",
+                "autonomy_paused_for_worker_failure",
                 "autonomy_watchdog",
-                stop_active=True,
+                {"termination_cause": run.get("termination_cause")},
             )
             return
         if run["status"] == "completed":
@@ -5448,14 +6161,269 @@ class AgentService:
     ) -> None:
         if node_id not in SHARED_FIRST_BATCH_NODES:
             return
+        cap = self._node_multiplex_cap(node_id)
         if self._node_has_completed_run(workflow["id"], node_id):
             return
         active = self._active_targets_for_node(workflow, node_id)
+        if cap is not None and len(active) > cap:
+            # A capped node has no full-width batch to demand; the cap itself
+            # is the shared-parameter unit.
+            return
         if requested != active:
+            if self._node_full_width_submission_failed(
+                workflow["id"], node_id, active
+            ):
+                return
             raise AutonomyScopeError(
                 f"The first {node_id} run must multiplex every active target "
                 f"{sorted(active)} with the same parameters"
             )
+
+    def _node_multiplex_cap(self, node_id: str) -> int | None:
+        """Largest multiplex group this node allows, if it caps one.
+
+        Operator instruction 2026-09-21: 04 never submits more than five
+        targets at once on this hardware. Nodes without the key are uncapped
+        and keep multiplexing every active target.
+        """
+
+        try:
+            definition = self.policy.node_definition(node_id)
+        except Exception:  # pragma: no cover - unknown node handled elsewhere
+            return None
+        value = definition.get("max_multiplex_targets")
+        if isinstance(value, bool) or not isinstance(value, int):
+            return None
+        return value if value > 0 else None
+
+    def _node_is_single_pass(self, node_id: str) -> bool:
+        """True for a node that runs once on defaults and then moves on.
+
+        Operator instruction 2026-09-21 for 07d and 07b: one full-width run
+        with the node defaults, no retry, no parameter adjustment and no
+        per-target chasing. Passing evidence still commits, because that is
+        the node's output; a target that does not pass simply carries no
+        update and does not hold the workflow up.
+        """
+
+        try:
+            definition = self.policy.node_definition(node_id)
+        except Exception:  # pragma: no cover - unknown node handled elsewhere
+            return False
+        return bool(definition.get("single_pass"))
+
+    def _validate_single_pass_node(
+        self, workflow: dict[str, Any], node_id: str, merged: dict[str, Any]
+    ) -> None:
+        """Refuse a second run at a node that runs once on defaults.
+
+        The one exception is the active-reset repeat the operator asked for at
+        07b: a qubit whose thermal run cleared the trigger fidelity earns
+        exactly one more 07b run with active reset, and that repeat is its
+        accepted result.
+        """
+
+        if not self._node_is_single_pass(node_id):
+            return
+        if not self._node_has_completed_run(workflow["id"], node_id):
+            return
+        if self._is_active_reset_repeat(workflow, node_id, merged):
+            return
+        # Single pass means one pass over each target, not one run over the
+        # whole chip. A node that has to be split into multiplex subgroups
+        # still needs a run per subgroup, so only refuse targets that have
+        # already been measured here.
+        measured = self._single_pass_measured_targets(workflow, node_id)
+        requested = {str(name) for name in merged.get("qubits", [])}
+        repeated = sorted(requested & measured)
+        if not repeated:
+            return
+        raise AutonomyScopeError(
+            f"{node_id} runs once per target on the node defaults and then "
+            f"advances; {repeated} already have a completed run here, so do "
+            "not schedule another for them"
+        )
+
+    def _single_pass_measured_targets(
+        self, workflow: dict[str, Any], node_id: str
+    ) -> set[str]:
+        """Targets already measured by a completed run at this node."""
+
+        measured: set[str] = set()
+        for run in self.db.all(
+            "SELECT parameters_json FROM runs WHERE workflow_id = ? "
+            "AND node_id = ? AND status = 'completed'",
+            (workflow["id"], node_id),
+        ):
+            names = json_loads(run.get("parameters_json"), {}).get("qubits", [])
+            if isinstance(names, list):
+                measured.update(str(name) for name in names)
+        return measured
+
+    def _is_active_reset_repeat(
+        self, workflow: dict[str, Any], node_id: str, merged: dict[str, Any]
+    ) -> bool:
+        """True for the single permitted active-reset repeat at 07b."""
+
+        if node_id != str(
+            self.policy.raw["reset_policy"]["active_qualification_node"]
+        ):
+            return False
+        if _reset_type(merged) != "active":
+            return False
+        if self._active_reset_repeat_targets(workflow) is None:
+            return False
+        for run in self.db.all(
+            "SELECT parameters_json FROM runs WHERE workflow_id = ? "
+            "AND node_id = ?",
+            (workflow["id"], node_id),
+        ):
+            if _reset_type(json_loads(run.get("parameters_json"), {})) == "active":
+                # The repeat has already been taken.
+                return False
+        return True
+
+    def _active_reset_repeat_targets(
+        self, workflow: dict[str, Any]
+    ) -> set[str] | None:
+        """Targets whose thermal 07b fidelity earns the active-reset repeat.
+
+        Returns None when no completed thermal 07b evidence exists yet, and an
+        empty set when it exists but nothing cleared the trigger.
+        """
+
+        node_id = str(self.policy.raw["reset_policy"]["active_qualification_node"])
+        rules = self.policy.raw["analysis"].get(node_id, {})
+        trigger = rules.get("active_reset_trigger_fidelity")
+        if trigger is None:
+            trigger = rules.get("active_reset_min_readout_fidelity")
+        if trigger is None:
+            return None
+        trigger = float(trigger)
+        seen = False
+        qualifying: set[str] = set()
+        for run in self.db.all(
+            "SELECT parameters_json, analysis_json FROM runs "
+            "WHERE workflow_id = ? AND node_id = ? AND status = 'completed' "
+            "ORDER BY rowid",
+            (workflow["id"], node_id),
+        ):
+            parameters = json_loads(run.get("parameters_json"), {})
+            if _reset_type(parameters) == "active":
+                continue
+            analysis = json_loads(run.get("analysis_json"), {})
+            results = analysis.get("fit_quality", {})
+            results = results.get("results") if isinstance(results, dict) else None
+            if not isinstance(results, dict):
+                continue
+            seen = True
+            for name, fit in results.items():
+                if not isinstance(fit, dict):
+                    continue
+                fidelity = fit.get("readout_fidelity")
+                if not isinstance(fidelity, (int, float)) or isinstance(
+                    fidelity, bool
+                ):
+                    continue
+                if float(fidelity) > trigger:
+                    qualifying.add(str(name))
+        return qualifying if seen else None
+
+    def _validate_multiplex_cap(self, node_id: str, requested: set[str]) -> None:
+        cap = self._node_multiplex_cap(node_id)
+        if cap is None or len(requested) <= cap:
+            return
+        raise AutonomyScopeError(
+            f"{node_id} multiplexes at most {cap} targets per run; "
+            f"{len(requested)} were requested. Split them into groups of "
+            f"{cap} or fewer."
+        )
+
+    def _node_full_width_submission_failed(
+        self,
+        workflow_id: str,
+        node_id: str,
+        active: set[str],
+    ) -> bool:
+        """True once a full-width attempt at this node failed to reach hardware.
+
+        Operator instruction 2026-09-19: a program covering every active target
+        can be too large to finish compiling and transferring before the QOP
+        queue-submission deadline.  Such a failure is recorded as
+        ``program_submission_timeout`` once a live probe has confirmed the
+        instrument is healthy, and older runs recorded it as
+        ``instrument_unreachable``; both are accepted here.  The shared-first-
+        batch rule would otherwise block the only remaining recovery, measuring
+        the targets in smaller multiplex subgroups, so it is waived once the
+        full width has demonstrably been tried and could not be submitted.
+        """
+
+        for run in self.db.all(
+            "SELECT parameters_json FROM runs WHERE workflow_id = ? "
+            "AND node_id = ? AND status = 'failed' "
+            "AND termination_cause IN "
+            "('program_submission_timeout', 'instrument_unreachable')",
+            (workflow_id, node_id),
+        ):
+            attempted = {
+                str(target)
+                for target in json_loads(run.get("parameters_json"), {}).get(
+                    "qubits", []
+                )
+            }
+            if attempted == active:
+                return True
+        return False
+
+    def _node_is_finished_and_fully_decided(
+        self, workflow: dict[str, Any], node_id: str
+    ) -> bool:
+        """True when the current node is done but cannot record `advance`.
+
+        The playbook's scientific boundary requires `manual_review` on the
+        target's evidence run. When that boundary lands on the node's last run
+        there is nothing left to record `advance` on, and no further run can be
+        scheduled either, because every active target is resolved or
+        incomplete. Without this the workflow deadlocks at a node it has
+        actually finished. Requesting the next node in sequence is then the
+        advance, and it is allowed only when the node really is finished and
+        every one of its runs already carries a decision.
+        """
+
+        current = str(workflow["current_node"] or "")
+        if not current or current not in SUBGROUP_NODES:
+            return False
+        sequence = list(self.settings.workflow_sequence)
+        if current not in sequence:
+            return False
+        index = sequence.index(current)
+        if index >= len(sequence) - 1 or node_id != sequence[index + 1]:
+            return False
+        if not self._node_has_completed_run(workflow["id"], current):
+            return False
+        if self._node_is_single_pass(current):
+            # Finished once every active target has had its one pass.
+            unmeasured = self._active_targets_for_node(
+                workflow, current
+            ) - self._single_pass_measured_targets(workflow, current)
+            if unmeasured:
+                return False
+        else:
+            active = self._active_targets_for_node(workflow, current)
+            unresolved = (
+                active
+                - self._node_target_resolution(workflow["id"], current)
+                - self._autonomy_incomplete_targets_for_node(workflow["id"], current)
+            )
+            if unresolved:
+                return False
+        undecided = self.db.one(
+            "SELECT r.id FROM runs r LEFT JOIN decisions d ON d.run_id = r.id "
+            "WHERE r.workflow_id = ? AND r.node_id = ? AND d.decision IS NULL "
+            "LIMIT 1",
+            (workflow["id"], current),
+        )
+        return undecided is None
 
     def _validate_unresolved_retry_targets(
         self,

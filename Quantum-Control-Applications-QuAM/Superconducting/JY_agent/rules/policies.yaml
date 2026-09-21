@@ -13,19 +13,94 @@ approval:
 # One human approval delegates only the bounded actions below. A null total-run
 # limit is intentional; the per-(node, qubit) attempt limit remains mandatory.
 autonomy:
+  # Default budget when automatic-mode entry does not name one.
   duration_hours: 8
+  # Operator instruction 2026-09-20: entry may request a different budget for
+  # that session, because a ten-qubit bring-up through the statistics nodes
+  # does not fit in eight hours. The human still approves the actual number on
+  # the Dashboard; this is the ceiling an agent may ask for.
+  max_duration_hours: 24
   max_total_runs: null
   max_attempts_per_node_qubit: 20
   auto_state_commit_analysis_statuses: ["pass"]
+  # Operator instruction 2026-09-20. A run whose overall analysis_status is
+  # `needs_review` may still commit the subset of qubits that individually
+  # passed every check, because the node refuses a further run once a target is
+  # resolved and the calibrated value would otherwise be lost for good. Only
+  # per-target passing evidence is ever committed; a failure that belongs to the
+  # run as a whole still blocks every target. Set to false to restore the
+  # older all-or-nothing behaviour.
+  partial_pass_state_commit: true
   pause_on_analysis_statuses: []
   emergency_stop_grace_seconds: 30
   watchdog_interval_seconds: 2
+  # Operator instruction 2026-09-20. A refusal that happens before the worker
+  # reaches hardware is a correctable planning error, not a loss of control:
+  # nothing ran, so refusing the action is the whole protection and ending the
+  # lease only costs a new human approval. `parameter_policy_violation` and
+  # out-of-scope requests therefore no longer halt; they are refused and
+  # recorded. An unrecognized worker exception now pauses the lease for the
+  # operator (resumable with `恢復量測`) instead of ending it. Only the
+  # conditions below, which all mean JY can no longer account for the hardware
+  # or the state file, still halt.
   halt_conditions:
     - "snapshot_missing"
-    - "worker_failure"
     - "state_hash_conflict"
     - "hardware_lock_anomaly"
-    - "parameter_policy_violation"
+  # Operator instruction 2026-09-20. A QMTimeoutError is not by itself an
+  # outage. The worker separates three causes before deciding whether to stop:
+  # a program too large to submit (the deadline expired in a `qm` frame that
+  # submits a program, the gRPC status was DEADLINE_EXCEEDED, and a probe right
+  # after the failure got the QOP to answer a health check), a wedged or dead
+  # QOP, and a network fault. Only the first keeps the lease running, and only
+  # while more than one target was attempted, so the agent can halve the
+  # multiplex group without an operator. See `rules/PLAYBOOK.md`, "Halve the
+  # multiplex group when a run times out on submission".
+  multiplex_submission_timeout:
+    halving_ladder: "all -> half -> half again -> single"
+    keep_lease_active: true
+    escalate_at_single_target: true
+  # A worker exception matching one of these signatures is a parameter the
+  # protected node itself rejects: deterministic, reproducible, and fixed by
+  # choosing a different value. The lease stays active so the agent can correct
+  # the parameter; it must never resend the value that crashed. Every other
+  # worker exception pauses the lease for the operator. Add an entry only
+  # together with its `rules/experiences/<node>.md` lesson.
+  recoverable_worker_exceptions:
+    - id: "02c_fractional_power_limits"
+      nodes: ["02c"]
+      exception_types: ["ValidationError"]
+      message_markers: ["int_from_float", "min_power_dbm", "max_power_dbm"]
+      parameters: ["min_power_dbm", "max_power_dbm"]
+      remedy: >-
+        02c types min_power_dbm/max_power_dbm as int. Use whole-number dBm
+        limits and change the integer window width or num_power_points instead
+        of a fractional endpoint.
+    - id: "03a_arbitrary_frequency_before_flux_calibration"
+      nodes: ["03a"]
+      exception_types: ["ZeroDivisionError"]
+      message_markers: ["float division by zero"]
+      parameters: ["arbitrary_qubit_frequency_in_ghz"]
+      remedy: >-
+        freq_vs_flux_01_quad_term is still zero this early in bring-up. Move the
+        scan with jy_request_03a_candidate_center or
+        jy_request_03a_window_shift, which only touch LO and IF.
+    # Operator decision 2026-09-20, after run
+    # 450064c6223f4f16bb1f71d6dbb15efc: the program was submitted and executed,
+    # then the QOP failed while streaming results back. A probe immediately
+    # afterwards completed a cluster health check, so the instrument was
+    # healthy. Treat it like an oversized program on the downstream side and
+    # halve the multiplex group, exactly as for a submission timeout.
+    - id: "fetch_stage_data_fetching_error"
+      nodes: []
+      exception_types: ["DataFetchingError"]
+      message_markers: ["unexpected error in rpc handling"]
+      parameters: ["qubits"]
+      remedy: >-
+        The QOP accepted and ran the program but failed to stream the results
+        back. Halve the multiplex group and repeat the node, continuing to
+        halve on further failures; a single target that still fails this way
+        is not a data-volume problem and goes to the operator.
 
 # Thermal reset is the safe default everywhere. Active reset is evidence-gated
 # per qubit by an active-reset 07b run with compact clouds and >= 85% fidelity.
@@ -34,7 +109,7 @@ autonomy:
 reset_policy:
   default_type: "thermal"
   active_qualification_node: "07b"
-  active_min_readout_fidelity: 0.85
+  active_min_readout_fidelity: 0.80
   active_statistics_verification_nodes: ["05", "06", "06b"]
 
 instrument_limits:
@@ -81,8 +156,10 @@ analysis:
     min_robust_snr: 3.0
   "04":
     # q3/q4/q5 reference run: 14.86 / 24.73 / 26.91 at 500 averages.
-    # The floor is deliberately anchored just below the weakest accepted trace.
-    min_robust_snr: 14.0
+    # Operator instruction 2026-09-20: lowered from 14.0. A Power Rabi trace
+    # with a clean single oscillation and a finite interior Pi fit is already
+    # correct well below that anchor; q2 sat at 9.57 with a textbook curve.
+    min_robust_snr: 7.0
     noise_confirmation_num_averages: [500, 1000, 2000, 4000]
     max_noise_confirmation_num_averages: 4000
   "05":
@@ -92,7 +169,16 @@ analysis:
     max_noise_confirmation_num_averages: 8000
   "07b":
     min_readout_fidelity: 0.70
-    active_reset_min_readout_fidelity: 0.85
+    # Operator instruction 2026-09-21: a thermal 07b result above this
+    # fidelity earns one active-reset repeat, and that repeat qualifies the
+    # qubit for active reset downstream. One number governs both, so the
+    # trigger and the qualification floor are deliberately the same.
+    active_reset_min_readout_fidelity: 0.80
+    active_reset_trigger_fidelity: 0.80
+    # 07b is single-pass, so morphology is no longer a gate at this node and
+    # must not silently block active-reset qualification either. Set this back
+    # to true to restore the compact-cloud requirement for qualification.
+    active_reset_requires_morphology: false
     max_cloud_axis_ratio: 4.0
     max_p95_to_median_radius: 4.0
     max_p99_to_median_radius: 4.0
@@ -166,7 +252,8 @@ state_commit:
     - "^/qubits/q[0-9]+/xy/intermediate_frequency$"
     - "^/qubits/q[0-9]+/xy/operations/[A-Za-z0-9_-]+/amplitude$"
     - "^/qubits/q[0-9]+/resonator/intermediate_frequency$"
-    - "^/qubits/q[0-9]+/resonator/operations/readout/(amplitude|full_scale_power_dbm|integration_weights_angle)$"
+    # `length` is 07d's readout-duration output; the others predate it.
+    - "^/qubits/q[0-9]+/resonator/operations/readout/(amplitude|full_scale_power_dbm|integration_weights_angle|length)$"
     - "^/qubits/q[0-9]+/resonator/operations/readout/(threshold|rus_exit_threshold)$"
     - "^/qubits/q[0-9]+/resonator/confusion_matrix$"
     - "^/qubits/q[0-9]+/extras/(bare_resonator_freq|idle_freq|dressed_resonator_freq)$"
@@ -256,8 +343,10 @@ nodes:
       simulate: "bool"
       simulation_duration_ns: "positive_int"
       timeout: "positive_int"
-      max_power_dbm: "number"
-      min_power_dbm: "number"
+      # The protected node's Parameters model types both as `int`; a fractional
+      # dBm is rejected by pydantic (`int_from_float`) before anything runs.
+      max_power_dbm: "int"
+      min_power_dbm: "int"
       num_power_points: "positive_int"
       max_amp: "positive_number"
       flux_point_joint_or_independent: "joint_literal"
@@ -310,12 +399,22 @@ nodes:
     name: "04_Power_Rabi"
     script: "04_Power_Rabi.py"
     flux_behavior: "joint"
+    # Operator instruction 2026-09-21. 04 never multiplexes more than five
+    # targets in one program, whatever the active set is. On this hardware a
+    # ten-qubit Power Rabi has never submitted before the QOP queue deadline,
+    # and chasing it costs a full halving ladder every time the node starts.
+    # The cap replaces the shared-first-batch rule for this node only: the
+    # first 04 run is the first capped group rather than every active target.
+    # Every other node still multiplexes all active targets.
+    max_multiplex_targets: 5
     defaults:
       num_averages: 500
       operation_x180_or_any_90: "x180"
       min_amp_factor: 0.0
       max_amp_factor: 1.9
-      amp_factor_step: 0.01
+      # Operator instruction 2026-09-19: fewer amplitude points so the program
+      # finishes transferring before the queue-submission deadline.
+      amp_factor_step: 0.02
       max_number_rabi_pulses_per_sweep: 1
       flux_point_joint_or_independent: "joint"
       reset_type_thermal_or_active: "thermal"
@@ -323,7 +422,9 @@ nodes:
       update_x90: true
       simulate: false
       simulation_duration_ns: 1500
-      timeout: 200
+      # Operator instruction 2026-09-19: raised from 200 after repeated
+      # instrument-connectivity pauses during 04.
+      timeout: 500
       load_data_id: null
       multiplexed: true
     allowed_parameters:
@@ -376,10 +477,60 @@ nodes:
       load_data_id: "optional_positive_int"
       multiplexed: "bool"
 
+  # Operator instruction 2026-09-21: 07d and 07b each run exactly once, with
+  # the node defaults, and the workflow moves on. `single_pass: true` means the
+  # node is complete after one analyzed full-width run whatever the analysis
+  # says: no retry, no parameter adjustment, no per-target chasing. Passing
+  # evidence still commits, because that is the node's output; a target that
+  # does not pass simply carries no update.
+  "07d":
+    name: "07d_Readout_Frequency_Duration_Power_Optimization"
+    script: "07d_Readout_Frequency_Duration_Power_Optimization.py"
+    flux_behavior: "joint"
+    single_pass: true
+    defaults:
+      multiplexed: true
+      flux_point_joint_or_independent: "joint"
+      num_runs: 40
+      frequency_span_in_mhz: 6
+      frequency_step_in_mhz: 0.2
+      min_amplitude_factor: 0.2
+      max_amplitude_factor: 1.99
+      num_amplitudes: 15
+      max_duration_in_ns: 2080
+      num_durations: 8
+      plotting_dimension: "2D"
+      fidelity_smoothing_intensity: 0.5
+      max_readout_amplitude: 0.125
+      load_data_id: null
+      simulate: false
+      simulation_duration_ns: 10000
+      timeout: 100
+    allowed_parameters:
+      qubits: "qubit_list"
+      multiplexed: "bool"
+      flux_point_joint_or_independent: "joint_literal"
+      num_runs: "positive_int"
+      frequency_span_in_mhz: "positive_number"
+      frequency_step_in_mhz: "positive_number"
+      min_amplitude_factor: "nonnegative_number"
+      max_amplitude_factor: "positive_number"
+      num_amplitudes: "positive_int"
+      max_duration_in_ns: "positive_int"
+      num_durations: "positive_int"
+      plotting_dimension: "plot_dimension_literal"
+      fidelity_smoothing_intensity: "nonnegative_number"
+      max_readout_amplitude: "positive_number"
+      load_data_id: "optional_positive_int"
+      simulate: "bool"
+      simulation_duration_ns: "positive_int"
+      timeout: "positive_int"
+
   "07b":
     name: "07b_IQ_Blobs"
     script: "07b_IQ_Blobs.py"
     flux_behavior: "joint"
+    single_pass: true
     defaults:
       multiplexed: true
       flux_point_joint_or_independent: "joint"

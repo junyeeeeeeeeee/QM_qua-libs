@@ -19,9 +19,13 @@ then call the selected entry tool. If Ensure returns `recovery_only`, do not cal
 an entry tool or expose a public URL; direct the on-site operator to the returned
 loopback operator console and wait for formal lock recovery.
 
-For `進入 JY 量測模式`, call `jy_enter_measurement_mode`, then propose exactly
+For `進入 JY 量測模式`, call `jy_enter_measurement_mode` with `client_id` and
+`activation_phrase` only unless the operator explicitly overrides them. Omit
+`targets` and `multiplexed`; a new workflow uses `state.json` `active_qubit_names`
+and defaults `multiplexed=true`. Then propose exactly
 one registered run or state change at a time and wait for each Dashboard approval.
-For `進入 JY 自動量測模式`, call `jy_enter_autonomy_mode`, wait for the bounded
+For `進入 JY 自動量測模式`, call `jy_enter_autonomy_mode` the same way (omit
+`targets` and `multiplexed` unless overridden), wait for the bounded
 lease approval with `jy_wait_for_autonomy_status`, then use only `jy_autonomy_*`
 execution/state tools within scope. This exact automatic-mode phrase also
 authorizes a host that supports durable goals (for example Codex `/goal`) to
@@ -41,9 +45,19 @@ exact English aliases.
 For either mode, show only the entry result's top-level `browser_url`; approval
 and control fields are internal navigation metadata for the same Dashboard and
 must not be presented as extra websites. The public `/` entry links to Home,
-Approval, and Results & controls pages for the active session.
+Approval, and Experiment results pages for the active session.
+Return the bare URL without a bootstrap query. Every browser uses the fixed
+ignored `JY_agent/runtime/dashboard-password.txt`; do not create pairing links.
 Never approve for the operator or bypass policy, snapshot, state-hash, lock, or
 quota gates.
+While measurement mode is open, any paused turn must copy
+`operator_handoff.chat` verbatim as a three-item markdown list, never as one
+paragraph: what to do, which phrase to send afterwards, and
+`如需結束量測，請於網頁首頁結束量測後再對話輸入「結束量測」。`
+Successful entry shows only `browser_url`. After `已核准` / `Approved`, the
+next reply starts with `已核准`. A live turn may execute `結束量測` directly; a
+paused or disconnected turn needs Dashboard Home shutdown first, then
+`結束量測` to verify.
 
 For configured stop/exit wording, request full shutdown and poll any active run.
 The worker first receives a cooperative authenticated stop request; after the
@@ -64,7 +78,10 @@ local safety recovery is still required.
 
 Treat recognized instrument-connectivity failures as paused measurement state,
 not a generic crash. Do not schedule another experiment until connectivity is
-repaired and the operator resumes. If the AI app disconnects, Dashboard controls
+repaired and the operator issues `恢復量測` / `Resume measurement`; then call
+`jy_resume_measurement_mode` for the same workflow/session. Restart the current
+node as a new run rather than claiming to continue the interrupted Python stack.
+Do not resume through a retained hardware lock; use local recovery. If the AI app disconnects, Dashboard controls
 remain available; after reconnection, `結束量測` / `End measurement` verifies
 full shutdown. Read
 `../../../Quantum-Control-Applications-QuAM/Superconducting/JY_agent/Command.md`

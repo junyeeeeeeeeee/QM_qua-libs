@@ -27,7 +27,7 @@
    A URL may be local or a
    token-protected public HTTPS URL; never replace it with a guessed URL.
    Preserve the same top-level `/` entry for the workflow/service lifetime. It
-   links to Home, Approval, and Results & controls; every run remains in the
+   links to Home, Approval, and Experiment results; every run remains in the
    numbered dropdown until shutdown. When ending a turn in measurement mode,
    copy `operator_handoff.chat` as a three-item markdown list, never as one
    paragraph, so the operator always sees what to do next, which exact phrase
@@ -411,6 +411,44 @@ have robust SNR of at least 25, anchored to the accepted q3/q4/q5 reference run
 then 8000 averages. Reaching the averaging ceiling without the SNR floor leaves
 the target unresolved; it does not convert a noisy fit into a completed result.
 
+### 07d and 07b run once on defaults
+
+Operator instruction, 2026-09-21. 07d Readout Frequency/Duration/Power
+Optimization is part of the sequence and runs immediately before 07b, so the
+readout it optimises is the one 07b then characterises. Both nodes carry
+`single_pass: true` in `rules/policies.yaml`.
+
+A single-pass node runs exactly once, full width, on the node defaults, and the
+workflow advances whatever the analysis says. Do not retry it, do not adjust its
+parameters, and do not chase individual targets through it — a second run is
+refused before the worker reaches hardware. Evidence gating is unchanged:
+a target whose analysis passes still commits its state patch, because that is
+the node's output, and a target that does not pass simply carries no update and
+does not hold the workflow up.
+
+This replaces the tail-power ladder below as the normal path for 07b. Keep the
+ladder documented: it is still the right tool if an operator deliberately
+reopens 07b, and it records what the morphology rule is protecting against.
+
+07b has one exception to the single run. Any qubit whose thermal result is
+**above** `analysis."07b".active_reset_trigger_fidelity` (0.80) earns exactly
+one more 07b run, with `reset_type_thermal_or_active: "active"`. Run those
+qubits together; that repeat is their accepted 07b result and it qualifies
+them to use active reset in later nodes, while every other qubit stays
+thermal. A second thermal run is still refused, and so is a second active run.
+`jy_get_next_action` proposes the repeat itself, with the qualifying target
+list, before it reports `advance`.
+
+Because 07b no longer gates on morphology, morphology no longer gates
+active-reset qualification either: `active_reset_requires_morphology` is
+false, so an active run qualifies on fidelity alone. The floor and the trigger
+are the same number, 0.80, deliberately - one threshold decides both. A
+thermal run never qualifies a qubit for active reset, whatever its fidelity.
+
+The statistics rule is unchanged: before any 05st or 06st run uses active
+reset, 05, 06 and 06b must be repeated and accepted with active reset for
+those qubits.
+
 ### 07b — IQ blobs
 
 Require a saved discriminator plot and a finite per-qubit readout fidelity of at
@@ -419,7 +457,7 @@ must look like a compact, approximately round IQ cloud. Some overlap between the
 two round clouds is acceptable; a long line/tail, crescent, or strongly elongated
 cloud is a power-saturation signature and must fail even when fitted fidelity is
 above 0.5. JY enforces covariance-axis and radial-tail ratios from `ds.h5`, and
-suppresses every discriminator state patch when morphology fails.
+suppresses the discriminator state patch of every qubit whose morphology fails.
 
 The 99th-percentile radius must remain within `4x` the median radius for each
 prepared-state cloud. This intentionally rejects sparse or curved tails that can
@@ -510,15 +548,242 @@ candidate produced by the registered statistics node remains subject to the usua
 state-patch policy and commit authorization, but no extra statistics-specific
 fitting check is added.
 
+## A `needs_review` run still commits the qubits that passed
+
+Operator instruction, 2026-09-20. `analysis_status` is a single run-level
+verdict, but every acceptance check is per qubit. A run that is `needs_review`
+because one target failed must still commit the targets that passed: the node
+refuses a further run once every target is resolved, so suppressing the whole
+patch lost calibrated values for good. This happened three times in workflow
+`0892399eba47422b96c9203e8ead1523` — 02c committed none of nine passing
+targets, 03a none of seven, and 04's `q1`/`q2` were never recovered.
+
+The analyzer therefore reports, alongside `failure_reasons`:
+
+- `failure_reasons_by_target` — each failure attributed to the qubit it names.
+- `run_level_failure_reasons` — failures that belong to the run as a whole
+  (no saved plot, unreadable dataset, invalid recorded state updates). Any of
+  these still suppresses every target.
+- `passing_targets` — the qubits with no failure of their own in a run that has
+  no run-level failure. `candidate_state_patch` is filtered to these qubits.
+- `suppressed_patch_targets` — the qubits whose changes were dropped, and why.
+
+`jy_autonomy_commit_state` accepts a `needs_review` run only for
+`passing_targets`, and refuses any other target without halting the lease. Read
+`passing_targets` before proposing the commit, and say in the Reason which
+targets it covers and which are still unresolved. Only passing evidence is ever
+committed; this relaxes nothing else.
+
 ## Status meanings
 
 - `run.status`: worker lifecycle (`starting`, `running`, `stopping`, `completed`,
   `failed`, `stopped`, `cancelled_by_shutdown`, `force_stopped`).
 - `analysis_status`: deterministic evidence result (`pass`, `needs_review`,
-  `failed`).
+  `failed`). It is run-level; `passing_targets` carries the per-qubit verdict.
 - `workflow.status`: bring-up progress (`active`, `completed`, `stopped`,
   `recovery_required`).
 - `proposal.status`: approval lifecycle (`pending`, `approved`, `expired`,
   `consumed`).
 
 Do not substitute one status for another.
+
+## Instrument-connectivity failures never engage the hardware lock
+
+Operator instruction, 2026-09-19. A recognized instrument-connectivity failure
+(`failure_category: instrument_unreachable`) pauses the run and scheduling, but
+it must never retain the hardware lock and must never put JY into recovery-only
+quarantine — not even when the worker could not confirm hardware cleanup
+because the instrument was already unreachable. The worker still makes its
+best-effort `_stop_active_node_with_evidence()` attempt and still refuses to
+release the lock if `state.json` changed during the failed run; only the
+unverifiable-cleanup condition is waived.
+
+The operator's reasoning: when the cause is simply that the hardware is
+unreachable, the lock adds an extra manual unlock step at the local console
+without protecting anything — no job can be running on an instrument that
+cannot be reached. Recovery must stay a plain `恢復量測` /
+`jy_resume_measurement_mode` on the same paused lease.
+
+This does not relax the other lock rules. A retained lock from any other cause
+is still preserved for local recovery, is never deleted automatically, and
+still requires the operator console.
+
+## A run crash is classified: known ones continue, unknown ones pause
+
+Operator instruction, 2026-09-20, replacing the 2026-09-19 rule that every
+worker exception stopped for the operator. In automatic mode the lease must
+survive everything that can be corrected, so a crash is now classified:
+
+- **Registered node-parameter rejections continue.** A crash whose signature is
+  listed in `autonomy.recoverable_worker_exceptions` is a parameter the
+  protected node itself rejects: deterministic, reproducible, and fixed by a
+  different value. The lease stays active, the server records
+  `autonomy_recoverable_worker_exception` with the registered remedy, and you
+  choose a corrected parameter. Never resend the value that crashed.
+- **Everything else pauses.** An unrecognized worker exception pauses the lease
+  and scheduling, exactly like an instrument outage. Report to the operator
+  what crashed and why, and resume the same lease with `恢復量測` once they
+  decide. No new approval is needed, and the lease is not lost.
+
+Both currently registered signatures are also prevented before they run:
+fractional `min_power_dbm`/`max_power_dbm` in 02c is refused because the node
+types them as `int`, and `arbitrary_qubit_frequency_in_ghz` in 03a is refused
+while `freq_vs_flux_01_quad_term` is zero. Both were crashes in workflow
+`0892399eba47422b96c9203e8ead1523` and its predecessor.
+
+Unchanged: record the failure as a labeled lesson in
+`rules/experiences/<node>.md`, state plainly that no snapshot or plot exists,
+and never retry the exact parameter that crashed. Add a new entry to
+`recoverable_worker_exceptions` only together with its lesson.
+
+## A refusal before the hardware never ends the lease
+
+Operator instruction, 2026-09-20. A request that is rejected before the worker
+reaches the instrument -- an out-of-policy parameter, an out-of-scope target
+set, a state patch that fails validation, a premature `jy_analyze_run` -- does
+not end the authorization. Nothing ran, so refusing the action is the whole
+protection; ending the lease on top of that only costs a fresh human approval
+and stops a bring-up that could have continued. Every refusal is recorded as
+`autonomy_action_refused` and stays visible on the Dashboard.
+
+Correct the request and continue. The conditions that still halt the lease are
+only the ones where JY can no longer account for the hardware or the state
+file: `snapshot_missing`, `state_hash_conflict`, and `hardware_lock_anomaly`.
+
+The earlier trap where a refused `jy_autonomy_start_run` cost the lease is
+gone, but still check `current_node` before requesting the first run of a node:
+a refused request is a wasted round trip even when it is free.
+
+## Ask the server what to do next
+
+`jy_get_next_action(workflow_id)` returns the deterministic plan: the current
+node, the active/resolved/incomplete/unresolved target sets, attempts used and
+left per target, any required deterministic setup tool, and one of `wait`,
+`analyze`, `record_decision`, `setup`, `run`, `advance`, or `blocked`. For a
+`run` it gives the qubits and only the parameters that differ from the node
+defaults, plus the rule it applied.
+
+It is an aggregator over the same state the guards enforce, not a second
+opinion. When `notes` says no registered deterministic rule covers the
+situation, that is the honest answer: read the node's section above and
+`rules/experiences/<node>.md` and choose the parameters yourself. Use
+`jy_get_decision_experience` for what was tried before; each entry carries an
+`evidence` digest of the gated numbers, and `include_analysis=True` only when
+the digest is genuinely not enough.
+
+## 04 never multiplexes more than five targets
+
+Operator instruction, 2026-09-21. Power Rabi caps its multiplex group at five
+qubits, whatever the active set is, via `nodes."04".max_multiplex_targets: 5`
+in `rules/policies.yaml`. This is the one node with a cap; every other node
+still multiplexes all active targets and the rule below applies to them
+unchanged.
+
+For a capped node the cap replaces the shared-first-batch requirement: the
+first 04 run is the first group of five, not every active target, and the node
+is completed by repeating it for the remaining groups. A request above the cap
+is refused before the worker reaches hardware, which is a correctable planning
+error and does not halt the lease.
+
+Evidence, `as-qpu-10qV2_agent`: a ten-qubit 04 program has never once been
+accepted by this QOP. Workflow `2dba0368b00c4b06aeed1a1ceabbb3d9` spent seven
+runs walking 10 -> 5 -> 3 -> 2 -> 1 twice, either side of a genuine QOP outage
+and restart, without a single successful submission. Starting at five skips the
+first rung of that ladder every time the node begins.
+
+## Halve the multiplex group when a run times out on submission
+
+Operator instruction, 2026-09-20, replacing the earlier "three or four qubits"
+wording. Except at a capped node, every node starts the same way: the first run
+of a new node always multiplexes ALL active targets with one shared parameter
+set.
+
+If that run dies with `QMTimeoutError: A timeout of 100 seconds was reached`
+raised from `qm.execute()` / `add_to_queue`, assume the program carries too
+many qubits and halve the group. Measure the targets in two halves; if a half
+still times out, halve again, and keep halving.
+
+If a run carrying a SINGLE qubit still times out on submission, the cause is no
+longer program size. Treat it as a genuine instrument-side disconnection, stop
+scheduling, and hand it to the operator.
+
+So the ladder for ten active targets is 10 -> 5 -> 3/2 -> 1, and only a
+one-qubit timeout means the instrument itself is at fault. Keep one shared
+parameter set across the halves so their evidence stays comparable, and never
+narrow the sweep instead of the group: coarsening the swept axis does not fix a
+submission timeout.
+
+`service.py` waives the shared-first-batch rule once a full-width attempt has
+failed with `program_submission_timeout` or, for runs recorded before that
+category existed, `instrument_unreachable`. That waiver is what lets the halves
+be scheduled.
+
+### Which timeout is this? Three causes, one of them halves
+
+A `QMTimeoutError` alone does not say whether the program was too large, the
+QOP is wedged, or the network is down, so the worker decides with evidence
+rather than with the exception type. Do not re-derive this by hand: read
+`failure_category` and `instrument_probe` in the run's analysis.
+
+1. **Program too large** — `failure_category: program_submission_timeout`.
+   Requires all of: the deadline expired in a `qm` package frame that submits a
+   program (`execute` / `add_to_queue` / `_add_program` / `compile`), the gRPC
+   status was `DEADLINE_EXCEEDED` rather than a transport failure, and a live
+   probe right after the failure got the QOP to answer a health check. Only
+   this case halves, and only while more than one target was attempted. The
+   lease stays active and no operator is needed.
+2. **Instrument wedged or down** — `failure_category: instrument_unreachable`
+   with `instrument_probe.cause: "instrument"`. The socket was refused, or it
+   opened but the QOP never completed a health check. Scheduling pauses and the
+   operator restarts or inspects the QOP.
+3. **Network fault** — `failure_category: instrument_unreachable` with
+   `instrument_probe.cause: "network"`. Name resolution failed, the host was
+   unroutable, or nothing answered at the socket level. Scheduling pauses and
+   the operator checks the lab network.
+
+A single-target submission timeout whose probe still succeeds is out of halving
+room: the worker pauses it with `measurement_paused: true` and the operator
+message names the QOP job queue, not the network. Never halve in cases 2 and 3
+— there is nothing to shrink.
+
+Evidence behind the rule, node 04 on `as-qpu-10qV2_agent`: ten multiplexed
+targets failed at 171, 86 and 18 amplitude points (runs `cb707ffb…`,
+`9a09832b…`, `db832677…`), all with the identical 100 s message, so the
+eighteen-point program -- a tenth the size of the first -- bought nothing. The
+first four-qubit subgroup then submitted and completed in 58 seconds.
+
+The 100 s itself belongs to the `QuantumMachinesManager` created inside
+`machine.connect()` ([quam_root.py:215]); `qm_session(timeout=...)` and the
+node's `timeout` parameter do not affect it.
+
+## Record `advance`, not `manual_review`, on the run that finishes a node
+
+Lesson, 2026-09-20, workflow `0892399eba47422b96c9203e8ead1523` at node 04.
+
+A run carries exactly one decision, and `current_node` only moves when a
+decision names the next node. If the last run of a node is given
+`manual_review` with `next_node` still pointing at the current node, and every
+other run of that node already has a decision, the workflow cannot leave the
+node: `jy_autonomy_start_run` refuses a fresh run with "All active <node>
+targets are already resolved or incomplete", and `jy_record_decision` refuses a
+second decision on the same run.
+
+So when a target hits its scientific boundary and that closes the node, the
+order is:
+
+1. `jy_mark_scientifically_unmeasurable` for that target, then
+2. `jy_record_decision` with `advance` and the real `next_node`, whose Reason
+   states the target is incomplete at the boundary.
+
+Never `manual_review` on the run that completes a node.
+
+If the dead-end has already happened, an `advance` decision can be recorded
+against an earlier run of the same node that never received one -- a failed run
+qualifies, since `jy_record_decision` accepts `analysis_status: failed`. State
+plainly in the Reason that the decision is node-level and that this particular
+run produced no snapshot.
+
+Related trap: a refused `jy_autonomy_start_run` is itself a lease stop
+condition ("Authorized run was refused or failed to launch: ..."). Check
+`current_node` before requesting the first run of a new node; a request sent
+too early costs the lease and a fresh operator approval.

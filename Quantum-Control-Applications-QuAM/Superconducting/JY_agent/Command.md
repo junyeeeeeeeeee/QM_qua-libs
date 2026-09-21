@@ -13,7 +13,7 @@ subject to server policy, verified worker identity, and hardware-lock checks.
 | 用途 / Purpose | 中文 / Chinese | English | 行為 / Behavior |
 |---|---|---|---|
 | 一般量測 / Conversational measurement | `進入 JY 量測模式`、`進入JY量測模式` | `Enter JY measurement mode` | 啟動或重用服務；每次 run/state change 個別核准。新 workflow 的 targets 取自 `state.json` `active_qubit_names`，`multiplexed` 預設為 true。不必在對話寫 `target` 或 `multiplex`。 / Starts or reuses services; every run/state change is approved separately. New workflows use `state.json` `active_qubit_names` and default `multiplexed=true`; do not type `target` or `multiplex` in chat. |
-| 有限自動量測 / Bounded automatic measurement | `進入 JY 自動量測模式`、`進入JY自動量測模式` | `Enter JY automatic measurement mode` | 一次核准 8 小時有限 lease，再於核准範圍內自動推進。新 workflow 同樣使用 `active_qubit_names` 且 `multiplexed` 預設 true。 / Approves one eight-hour bounded lease, then advances within scope. New workflows also use `active_qubit_names` and default `multiplexed=true`. |
+| 有限自動量測 / Bounded automatic measurement | `進入 JY 自動量測模式`、`進入JY自動量測模式` | `Enter JY automatic measurement mode` | 一次核准有限 lease（預設 8 小時，進入時可指定，上限見 `policies.yaml` 的 `autonomy.max_duration_hours`），再於核准範圍內自動推進。新 workflow 同樣使用 `active_qubit_names` 且 `multiplexed` 預設 true。 / Approves one bounded lease (eight hours by default, specifiable at entry up to `autonomy.max_duration_hours`), then advances within scope. New workflows also use `active_qubit_names` and default `multiplexed=true`. |
 | 喚醒已核准工作 / Wake an approved session | `已核准` | `Approved` | 只在 agent host 暫停回合時使用；它不代替網頁核准。 / Used only when the agent host paused; it never substitutes for Dashboard approval. |
 | 暫停自動排程 / Pause automatic scheduling | `暫停 JY 自動量測` | `Pause JY automatic measurement` | 目前 run 完成後不再排新實驗，保留 lease 與網站。 / Stops new scheduling after the current run; keeps lease and site. |
 | 繼續自動排程 / Resume automatic scheduling | `繼續 JY 自動量測` | `Resume JY automatic measurement` | 恢復同一份未過期、paused lease。 / Resumes the same unexpired paused lease. |
@@ -24,10 +24,10 @@ subject to server policy, verified worker identity, and hardware-lock checks.
 | 安全恢復到關閉狀態 / Recover to a closed state | `恢復`、`恢复` | `Recover` | 不依賴已掛載的 JY MCP；收尾 stale workflow/process，再關閉可驗證的 JY 服務。絕不自動刪除 retained hardware lock。 / Does not require the attached JY MCP; converges stale workflow/process state and closes verified JY services. It never auto-deletes a retained lock. |
 
 `停止 JY 自動量測` 屬於完整結束語句；若只想保留網站，請使用「結束 JY 自動授權」
-或 Results & controls 頁面的對應按鈕。
+或首頁的對應按鈕。
 
 `停止 JY 自動量測` is a full-shutdown phrase. To keep the site, use
-`End JY automatic authorization` or the matching Results & controls button.
+`End JY automatic authorization` or the matching Home button.
 
 ## 對話回傳契約 / Operator reply contract
 
@@ -98,15 +98,18 @@ the Dashboard first.
 ## Dashboard 控制 / Dashboard controls
 
 - Home：`結束量測並關閉所有 JY 服務`，需輸入頁面顯示的
-  `SHUTDOWN <session-id>`。
+  `SHUTDOWN <session-id>`，以及 Pause、Resume、End automation（保留網站）、
+  Emergency stop worker（保留網站）。
 - Approval：核准待處理的 run、state change 或初始 bounded lease。
-- Results & controls：Pause、Resume、End automation（保留網站）、Emergency
-  stop worker（保留網站），以及該次服務的完整實驗下拉歷史。
+- 實驗結果：結果摘要（每次實驗的成功 qubit 與結果圖縮圖），以及該次服務的
+  完整實驗下拉歷史。
 
-- Home: full shutdown, protected by the displayed `SHUTDOWN <session-id>` text.
+- Home: full shutdown, protected by the displayed `SHUTDOWN <session-id>` text,
+  plus Pause, Resume, End automation (keep site), and Emergency stop worker
+  (keep site).
 - Approval: approves a pending run, state change, or initial bounded lease.
-- Results & controls: Pause, Resume, End automation (keep site), Emergency stop
-  worker (keep site), and the service-lifetime experiment history.
+- Experiment results: the result summary (successful qubits and plot thumbnails
+  per experiment) and the service-lifetime experiment history.
 
 ## 一次性維護指令 / One-line maintenance commands
 

@@ -160,6 +160,20 @@ class LiveDashboardTelemetryTests(unittest.TestCase):
             )
             lease_id = entered["authorization"]["id"]
             service.pause_autonomy(lease_id, "unit-test-human", "Test pause")
+            home_controls = asyncio.run(
+                handle_session_dashboard(
+                    _request(
+                        f"/session/{session_id}/home", {"session_id": session_id}
+                    ),
+                    service,
+                    view="home",
+                )
+            ).body.decode("utf-8")
+            self.assertIn('name="action" value="resume"', home_controls)
+            self.assertIn("結束自動授權（保留網站）", home_controls)
+            self.assertIn("緊急停止 worker（保留網站）", home_controls)
+            self.assertIn('name="operation" value="shutdown"', home_controls)
+
             results = asyncio.run(
                 handle_session_dashboard(
                     _request(
@@ -170,9 +184,9 @@ class LiveDashboardTelemetryTests(unittest.TestCase):
                     view="results",
                 )
             ).body.decode("utf-8")
-            self.assertIn('name="action" value="resume"', results)
-            self.assertIn("結束自動授權（保留網站）", results)
-            self.assertIn("緊急停止 worker（保留網站）", results)
+            self.assertIn("結果摘要", results)
+            self.assertNotIn('name="action" value="resume"', results)
+            self.assertNotIn("緊急停止 worker（保留網站）", results)
             self.assertNotIn('name="operation" value="shutdown"', results)
 
             resume_body = urlencode(
@@ -185,13 +199,13 @@ class LiveDashboardTelemetryTests(unittest.TestCase):
             resumed = asyncio.run(
                 handle_session_dashboard(
                     _request(
-                        f"/session/{session_id}/results",
+                        f"/session/{session_id}/home",
                         {"session_id": session_id},
                         method="POST",
                         body=resume_body,
                     ),
                     service,
-                    view="results",
+                    view="home",
                 )
             )
             self.assertEqual(resumed.status_code, 200)
@@ -605,7 +619,7 @@ class LiveDashboardTelemetryTests(unittest.TestCase):
             self.assertEqual(legacy_control.status_code, 303)
             self.assertEqual(
                 legacy_control.headers["location"],
-                f"/session/{dashboard['id']}/results?lang=zh-Hant",
+                f"/session/{dashboard['id']}/home?lang=zh-Hant",
             )
 
             approval_response = asyncio.run(

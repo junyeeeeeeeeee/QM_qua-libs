@@ -19,8 +19,19 @@ playbook, then use the project `jy_bringup` MCP server:
 
 For both modes, show only the entry result's top-level `browser_url`. Approval,
 controls, and all experiment results share that Dashboard service. The common
-`/` entry links to the session Home, Approval, and Results & controls pages; do
+`/` entry links to the session Home, Approval, and Experiment results pages; do
 not enumerate those internal routes as separate websites.
+The public URL is bare and has no bootstrap query. Browsers use the fixed ignored
+`JY_agent/runtime/dashboard-password.txt`; never create device-pairing links.
+
+While measurement mode is open, any paused turn must copy `operator_handoff.chat`
+verbatim as a three-item markdown list, never as one paragraph, so the operator
+always sees what to do, which exact phrase to send afterwards, and
+`如需結束量測，請於網頁首頁結束量測後再對話輸入「結束量測」。`
+Successful entry shows only the top-level `browser_url`. After the operator
+sends `已核准` or `Approved`, the next reply starts with exactly `已核准`.
+A live turn may execute `結束量測` directly; a paused or disconnected turn
+needs Dashboard Home shutdown first, then `結束量測` to verify.
 
 Treat `進入JY量測模式` and `進入JY自動量測模式` as identical aliases.
 Also treat `Enter JY measurement mode` and `Enter JY automatic measurement mode`
@@ -48,6 +59,9 @@ In JY context, `恢復` / `Recover` runs repository-root
 `.\jy_agent.ps1 -Action Recover`; it closes stale workflow/process state without
 depending on the MCP, deleting a retained lock, or killing an unverified
 process. Recognized instrument-connectivity failures pause scheduling and are
-reported on the Dashboard. See
+reported on the Dashboard. After on-site inspection, `恢復量測` / `Resume
+measurement` calls `jy_resume_measurement_mode` for the same workflow/session;
+the current node restarts as a new run. A retained hardware lock blocks this
+resume and still requires local recovery. See
 `Quantum-Control-Applications-QuAM/Superconducting/JY_agent/Command.md` for the
 complete bilingual aliases.

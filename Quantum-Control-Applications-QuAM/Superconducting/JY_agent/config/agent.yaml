@@ -23,7 +23,10 @@ paths:
 qualibrate_python: ""
 
 workflow:
-  sequence: ["02x", "02c", "02a", "03a", "04", "05", "07b", "06", "06b", "10a", "05st", "06st_t2star", "06st_t2e"]
+  # Operator instruction 2026-09-21: 07d runs immediately before 07b, so the
+  # readout frequency/duration/power optimisation lands before the IQ blobs
+  # that measure the discriminator it produces.
+  sequence: ["02x", "02c", "02a", "03a", "04", "05", "07d", "07b", "06", "06b", "10a", "05st", "06st_t2star", "06st_t2e"]
   default_flux_point: "joint"
   require_explicit_qubits: true
 

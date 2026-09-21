@@ -190,7 +190,7 @@ Quick tunnel URL 會隨重新建立而改變，舊 URL 過期是正常的。只�
 
 目前 entry result 最外層的 `browser_url` 是唯一應交給使用者的共用 `/` 入口。
 它會解析目前 session，再連到三個同 hostname、同 cookie、同 service lifetime 的
-分頁：首頁、核准、結果與控制。它們不是不同網站。舊 `/approve/...`、
+分頁：首頁、核准、實驗結果。它們不是不同網站。舊 `/approve/...`、
 `/autonomy/...`、`/session/...` 只做 303 redirect；direct/replacement lease 也會
 重新綁定同一 session。結果下拉紀錄會保留到完整關機。
 
@@ -293,7 +293,7 @@ pre-run hash 且沒有 restore error 時，worker 才會自動釋放本次 lock�
 
 Dashboard 的按鈕由本機 JY service 執行，不依賴 AI 對話持續在線。頁面仍可連時：
 
-1. 想稍後繼續：在 Results & controls 按 Pause。
+1. 想稍後繼續：在 Home 按 Pause。
 2. 想停止自動授權但保留診斷頁：按 End automation。
 3. 想全部關閉：到 Home 使用完整關機並輸入 `SHUTDOWN <session-id>`。
 

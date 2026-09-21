@@ -35,7 +35,7 @@ from jy_agent.analysis_02c import (
 from jy_agent.config import Settings
 from jy_agent.policy import PolicyEngine, PolicyError
 from jy_agent.reports import lightweight_report
-from jy_agent.service import AgentService
+from jy_agent.service import AgentService, AutonomyScopeError
 from jy_agent.state import (
     bootstrap_patch,
     commit_state,
@@ -931,7 +931,10 @@ class CoreTests(unittest.TestCase):
             settings = make_settings(Path(folder), state)
             service = AgentService(settings)
             workflow = start_test_workflow(service)
-            with self.assertRaisesRegex(Exception, "exactly match"):
+            # Subgroup nodes now accept any subset of the active targets, so the
+            # rule this pins is "a qubit outside the workflow is refused", by
+            # exception type rather than by wording.
+            with self.assertRaises(AutonomyScopeError) as refused:
                 service.request_run(
                     workflow["id"],
                     "02x",
@@ -939,6 +942,7 @@ class CoreTests(unittest.TestCase):
                     "Attempt an out-of-scope target.",
                     "unittest",
                 )
+            self.assertIn("q1", str(refused.exception))
 
     def test_poll_failed_run_backfills_failed_analysis(self) -> None:
         with tempfile.TemporaryDirectory() as folder:
@@ -987,18 +991,35 @@ class CoreTests(unittest.TestCase):
                 "unittest",
             )
             run_id = "offline-run"
+            # Advancing a node now requires per-qubit evidence, so the run must
+            # carry an analysis document that resolves q1, not just 'pass'.
             service.db.execute(
                 """
                 INSERT INTO runs(
                     id, workflow_id, proposal_id, node_id, parameters_json,
-                    status, analysis_status
-                ) VALUES (?, ?, ?, '02x', ?, 'completed', 'pass')
+                    status, analysis_status, analysis_json
+                ) VALUES (?, ?, ?, '02x', ?, 'completed', 'pass', ?)
                 """,
                 (
                     run_id,
                     workflow["id"],
                     proposal["id"],
                     json.dumps({"qubits": ["q1"]}),
+                    json.dumps(
+                        {
+                            "analysis_status": "pass",
+                            "node_id": "02x",
+                            "passing_targets": ["q1"],
+                            "fit_quality": {
+                                "results": {"q1": {"fit_successful": True}}
+                            },
+                            "dataset_metrics": {
+                                "qubits": {
+                                    "q1": {"robust_snr": 20.0, "edge_fraction": 0.4}
+                                }
+                            },
+                        }
+                    ),
                 ),
             )
             service.record_decision(
@@ -1272,41 +1293,58 @@ class AnalysisTests(unittest.TestCase):
             self.assertAlmostEqual(patch[0]["value"], 0.886)
             self.assertTrue(warnings)
 
-    def test_07b_active_reset_requires_compact_clouds_and_85_percent(self) -> None:
+    def test_07b_active_reset_qualifies_at_eighty_percent(self) -> None:
+        """Operator instruction 2026-09-21: the floor is 0.80, not 0.85.
+
+        07b is single-pass, so compact-cloud morphology is no longer a gate at
+        this node and must not silently block active-reset qualification
+        either; only the fidelity floor and an active-reset run decide it.
+        """
+
         with tempfile.TemporaryDirectory() as folder:
             settings = make_settings(Path(folder), sample_state(0.2, 0.1))
             analyzer = SnapshotAnalyzer(settings, PolicyEngine(settings))
 
-            below = analyzer._fit_quality(
-                "07b",
-                {
-                    "initial_parameters": {
-                        "reset_type_thermal_or_active": "active"
+            def qualify(fidelity: float, morphology_pass: bool) -> dict:
+                return analyzer._fit_quality(
+                    "07b",
+                    {
+                        "initial_parameters": {
+                            "reset_type_thermal_or_active": "active"
+                        },
+                        "results": {"q1": {"fidelity": fidelity}},
                     },
-                    "results": {"q1": {"fidelity": 84.9}},
-                },
-                dataset_metrics={
-                    "qubits": {"q1": {"morphology_pass": True, "clouds": {}}}
-                },
-                targets=["q1"],
-            )["results"]["q1"]
-            qualified = analyzer._fit_quality(
-                "07b",
-                {
-                    "initial_parameters": {
-                        "reset_type_thermal_or_active": "active"
+                    dataset_metrics={
+                        "qubits": {
+                            "q1": {
+                                "morphology_pass": morphology_pass,
+                                "clouds": {},
+                            }
+                        }
                     },
-                    "results": {"q1": {"fidelity": 85.0}},
-                },
-                dataset_metrics={
-                    "qubits": {"q1": {"morphology_pass": True, "clouds": {}}}
-                },
-                targets=["q1"],
-            )["results"]["q1"]
+                    targets=["q1"],
+                )["results"]["q1"]
 
-            self.assertTrue(below["fit_successful"])
-            self.assertFalse(below["active_reset_qualified"])
-            self.assertTrue(qualified["active_reset_qualified"])
+            self.assertFalse(qualify(79.9, True)["active_reset_qualified"])
+            self.assertTrue(qualify(80.0, True)["active_reset_qualified"])
+            # A tail no longer blocks qualification at this node.
+            self.assertTrue(qualify(84.0, False)["active_reset_qualified"])
+
+            thermal = analyzer._fit_quality(
+                "07b",
+                {
+                    "initial_parameters": {
+                        "reset_type_thermal_or_active": "thermal"
+                    },
+                    "results": {"q1": {"fidelity": 95.0}},
+                },
+                dataset_metrics={
+                    "qubits": {"q1": {"morphology_pass": True, "clouds": {}}}
+                },
+                targets=["q1"],
+            )["results"]["q1"]
+            # A thermal run never qualifies, however good the number.
+            self.assertFalse(thermal["active_reset_qualified"])
 
     def test_07b_long_tail_fails_even_when_fidelity_can_pass(self) -> None:
         with tempfile.TemporaryDirectory() as folder:

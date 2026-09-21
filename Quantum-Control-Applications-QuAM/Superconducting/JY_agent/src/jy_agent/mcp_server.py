@@ -35,9 +35,22 @@ call jy_enter_autonomy_mode, show its session Dashboard URL, wait for the one
 lease approval, keep the automatic agent task alive with
 jy_wait_for_autonomy_status while no action is ready, and then use only
 jy_autonomy_* execution tools. The automation lease
-enforces target/node scope, an eight-hour expiry, twenty attempts per node/qubit,
-pass-backed state commits, and hard-stop conditions. Low confidence and
+enforces target/node scope, an expiry (eight hours by default; pass
+duration_hours at entry only when the operator asks for a different budget),
+twenty attempts per node/qubit, and pass-backed state commits.
+Call jy_get_next_action for the deterministic plan -- current node, per-target
+resolved/incomplete/unresolved sets, attempts left, required setup tools, and
+either the parameters to change or a note that no registered rule covers the
+situation. Low confidence and
 manual_review do not halt the lease, but they do not bypass evidence requirements.
+A `needs_review` run still commits its `passing_targets`; nothing else.
+The lease survives everything correctable. A request refused before the worker
+reaches hardware -- out-of-policy parameter, out-of-scope targets, a premature
+analyze -- is recorded and refused, not halted; fix it and continue. A worker
+crash matching a registered signature in autonomy.recoverable_worker_exceptions
+keeps the lease and tells you the remedy; any other worker crash pauses the
+lease for the operator and resumes with the resume phrase. Only snapshot_missing,
+state_hash_conflict, and hardware_lock_anomaly end the lease.
 Recognized instrument-connectivity failures pause the experiment and scheduling
 instead of becoming a generic crash. Preserve the same workflow/session, wait for
 the operator to repair connectivity, then use jy_resume_measurement_mode with one
@@ -276,6 +289,7 @@ def jy_enter_autonomy_mode(
     activation_phrase: str,
     targets: list[str] | None = None,
     multiplexed: bool | None = None,
+    duration_hours: float | None = None,
     reason: str = "Operator entered JY autonomous measurement mode.",
     operation_id: str | None = None,
 ) -> dict[str, Any]:
@@ -283,13 +297,16 @@ def jy_enter_autonomy_mode(
 
     Omit targets to use state.json active_qubit_names. Omit multiplexed to
     default true for a new workflow; omitted multiplexed does not change an
-    existing workflow.
+    existing workflow. Pass duration_hours only when the operator asks for a
+    different budget than the configured default; it applies to a new lease
+    and the human still approves the number shown on the Dashboard.
     """
     request = {
         "client_id": client_id,
         "activation_phrase": activation_phrase,
         "targets": targets,
         "multiplexed": multiplexed,
+        "duration_hours": duration_hours,
         "reason": reason,
     }
     return _mutation(
@@ -301,6 +318,7 @@ def jy_enter_autonomy_mode(
             activation_phrase,
             targets,
             multiplexed=multiplexed,
+            duration_hours=duration_hours,
             reason=reason,
         ),
     )
@@ -332,10 +350,35 @@ def jy_get_run_telemetry(
 def jy_get_decision_experience(
     node_id: str | None = None,
     targets: list[str] | None = None,
-    limit: int = 50,
+    limit: int = 10,
+    include_analysis: bool = False,
 ) -> list[dict[str, Any]]:
-    """Get prior per-run Decision/Reason/Next records with evidence and timing."""
-    return service.decision_experience(node_id=node_id, targets=targets, limit=limit)
+    """Get prior per-run Decision/Reason/Next records with evidence and timing.
+
+    Each entry carries `evidence`, a per-qubit digest of the gated numbers.
+    Set include_analysis only when the digest is not enough; the full analysis
+    document per entry is large.
+    """
+    return service.decision_experience(
+        node_id=node_id,
+        targets=targets,
+        limit=limit,
+        include_analysis=include_analysis,
+    )
+
+
+@mcp.tool()
+def jy_get_next_action(workflow_id: str) -> dict[str, Any]:
+    """Say what this workflow needs next: wait, analyze, decide, setup, run, or advance.
+
+    Deterministic aggregation of the same state the guards enforce: current
+    node, per-target resolved/incomplete/unresolved sets, attempts left, the
+    required deterministic setup tools, the shared-first-batch rule, and the
+    configured averaging ladder. `run.parameters` carries only the values that
+    differ from the node defaults. When `notes` says no registered rule covers
+    the situation, read the cited playbook section instead of guessing.
+    """
+    return service.next_action(workflow_id)
 
 
 @mcp.tool()

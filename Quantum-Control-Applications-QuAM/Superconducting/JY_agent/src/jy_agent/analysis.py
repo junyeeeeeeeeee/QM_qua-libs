@@ -17,9 +17,11 @@ from .state import (
     filter_patch,
     json_diff,
     load_state,
+    patch_qubit_targets,
     pointer_get,
     recorded_updates_to_patch,
     snapshot_state_path,
+    split_patch_by_target,
 )
 from .util import json_loads, sha256_file
 
@@ -112,8 +114,10 @@ class SnapshotAnalyzer:
         failed_outcomes = {
             name: value for name, value in outcomes.items() if value != "successful"
         }
-        if failed_outcomes:
-            failures.append(f"Node outcomes contain failures: {failed_outcomes}")
+        for name, value in sorted(failed_outcomes.items()):
+            # Attribute the node's own per-qubit outcome to that qubit so one
+            # failing target cannot suppress a passing target's state patch.
+            failures.append(f"{name} node outcome is {value!r}, not successful.")
         if not plots:
             failures.append("No result plot was saved.")
 
@@ -372,24 +376,52 @@ class SnapshotAnalyzer:
             )
 
         status = "pass" if not failures else "needs_review"
-        if node_id == "03a" and status != "pass" and candidate_patch:
-            candidate_patch = []
-            warnings.append(
-                "03a state updates are suppressed because the scan did not pass "
-                "all fit, SNR, and sweep-edge checks."
+        failures_by_target, run_level_failures = _attribute_failures(
+            failures, targets
+        )
+        passing_targets = (
+            []
+            if run_level_failures
+            else sorted(
+                str(name) for name in targets if str(name) not in failures_by_target
             )
-        if node_id == "07b" and status != "pass" and candidate_patch:
-            candidate_patch = []
-            warnings.append(
-                "07b discriminator updates are suppressed because fidelity and "
-                "round-cloud morphology did not both pass."
+        )
+        suppressed_targets: list[str] = []
+        if status != "pass" and candidate_patch:
+            # Operator instruction 2026-09-20: a run that is `needs_review`
+            # overall must still commit the qubits that individually passed
+            # every check. Suppressing the whole patch lost calibrated values
+            # permanently, because the node then refused a further run for an
+            # already-resolved target. Only passing evidence is ever kept.
+            candidate_patch, dropped = split_patch_by_target(
+                candidate_patch, set(passing_targets)
             )
-        if node_id in {"04", "05"} and status != "pass" and candidate_patch:
-            candidate_patch = []
-            warnings.append(
-                f"{node_id} state updates are suppressed until every selected "
-                "qubit passes the configured robust-SNR and fit-quality checks."
+            suppressed_targets = sorted(
+                patch_qubit_targets(dropped) - set(passing_targets)
             )
+            if suppressed_targets:
+                warnings.append(
+                    f"{node_id} state updates are suppressed for "
+                    f"{suppressed_targets} because those targets did not pass "
+                    "every fit, SNR, morphology, and sweep-edge check."
+                )
+            unattributed = [
+                str(item.get("path", ""))
+                for item in dropped
+                if not re.match(r"^/qubits/q[0-9]+/", str(item.get("path", "")))
+            ]
+            if unattributed:
+                warnings.append(
+                    f"{node_id} state updates are suppressed for "
+                    f"{unattributed} because a non-passing run may commit only "
+                    "changes that belong to an individually passing qubit."
+                )
+            if run_level_failures:
+                warnings.append(
+                    f"{node_id} state updates are suppressed for every target "
+                    "because this run has failures that belong to the run as a "
+                    f"whole: {run_level_failures}"
+                )
         return {
             "analysis_status": status,
             "node_id": node_id,
@@ -401,6 +433,10 @@ class SnapshotAnalyzer:
             "03a_stage": stage_03a,
             "dataset_metrics": dataset_metrics,
             "failure_reasons": failures,
+            "failure_reasons_by_target": failures_by_target,
+            "run_level_failure_reasons": run_level_failures,
+            "passing_targets": passing_targets,
+            "suppressed_patch_targets": suppressed_targets,
             "warnings": warnings,
             "candidate_state_patch": candidate_patch,
             "rejected_state_change_count": len(rejected_patch),
@@ -822,6 +858,14 @@ class SnapshotAnalyzer:
             "04": [
                 r"^/qubits/q[0-9]+/xy/operations/[A-Za-z0-9_-]+/amplitude$",
             ],
+            # 07d optimises readout frequency, duration and power together.
+            # Without an entry here every one of its changes is discarded as
+            # unrelated and the node produces nothing.
+            "07d": [
+                r"^/qubits/q[0-9]+/resonator/intermediate_frequency$",
+                r"^/qubits/q[0-9]+/resonator/operations/readout/"
+                r"(amplitude|full_scale_power_dbm|length)$",
+            ],
             "05": [
                 r"^/qubits/q[0-9]+/T1$",
             ],
@@ -1052,6 +1096,12 @@ class SnapshotAnalyzer:
             active_min_fidelity = float(
                 rules_07b["active_reset_min_readout_fidelity"]
             )
+            # Operator instruction 2026-09-21: 07b is single-pass, so the
+            # compact-cloud rule is no longer a gate at this node and must not
+            # silently block active-reset qualification either.
+            active_needs_morphology = bool(
+                rules_07b.get("active_reset_requires_morphology", True)
+            )
             reset_type = _reset_type(data.get("initial_parameters", {}))
             normalized_results: dict[str, Any] = {}
             metrics_by_qubit = (
@@ -1081,21 +1131,26 @@ class SnapshotAnalyzer:
                     usable = usable_fidelity and morphology_pass
                     active_reset_qualified = (
                         reset_type == "active"
-                        and morphology_pass
+                        and (morphology_pass or not active_needs_morphology)
                         and fidelity is not None
                         and active_min_fidelity <= fidelity <= 1.0
                     )
                     if active_reset_qualified:
                         active_reset_reason = (
-                            "Active reset retained compact clouds at or above "
+                            "Active reset reached at or above "
                             f"{active_min_fidelity:g} fidelity."
+                            if not active_needs_morphology
+                            else (
+                                "Active reset retained compact clouds at or "
+                                f"above {active_min_fidelity:g} fidelity."
+                            )
                         )
                     elif reset_type != "active":
                         active_reset_reason = (
                             "This 07b run used thermal reset and cannot qualify "
                             "active reset."
                         )
-                    elif not morphology_pass:
+                    elif active_needs_morphology and not morphology_pass:
                         active_reset_reason = (
                             "Active reset did not preserve compact dual-cloud morphology."
                         )
@@ -2164,6 +2219,125 @@ def _run_targets(
     if not isinstance(targets, list):
         targets = list(outcomes)
     return [str(name) for name in targets]
+
+
+#: The numbers the playbook actually gates on, per qubit. A digest keeps only
+#: these, so a decision can be made from a handful of values instead of a whole
+#: analysis document.
+_DIGEST_METRIC_KEYS = (
+    "robust_snr",
+    "edge_fraction",
+    "feature_fwhm_hz",
+    "feature_coordinate",
+    "morphology_pass",
+)
+_DIGEST_FIT_KEYS = (
+    "fit_successful",
+    "drive_freq",
+    "Pi_amplitude",
+    "t1_seconds",
+    "coherence_seconds",
+    "readout_fidelity",
+    "morphology_pass",
+    "active_reset_qualified",
+    "relative_uncertainty",
+    "r_squared",
+    "coverage_lifetimes",
+    "samples_per_lifetime",
+    "fit_at_search_boundary",
+    "EPC",
+    "EPG",
+    "recommended_statistics_max_wait_time_in_ns",
+)
+
+
+def evidence_digest(analysis: dict[str, Any] | None) -> dict[str, Any]:
+    """Reduce an analysis document to the values a decision is made from.
+
+    Returns the run-level verdict plus, for each qubit, the gated metrics and
+    fit values that are present. Nothing is recomputed: a digest is a view of
+    the recorded analysis, never a second opinion about it.
+    """
+
+    if not isinstance(analysis, dict):
+        return {}
+    metrics_by_qubit = analysis.get("dataset_metrics", {})
+    metrics_by_qubit = (
+        metrics_by_qubit.get("qubits") if isinstance(metrics_by_qubit, dict) else None
+    )
+    fits_by_qubit = analysis.get("fit_quality", {})
+    fits_by_qubit = (
+        fits_by_qubit.get("results") if isinstance(fits_by_qubit, dict) else None
+    )
+    # Nodes without a per-qubit fitter record these as explicit nulls -- 02x
+    # stores `"fit_quality": {"results": null}` -- so coerce anything that is
+    # not a mapping before iterating it.
+    if not isinstance(metrics_by_qubit, dict):
+        metrics_by_qubit = {}
+    if not isinstance(fits_by_qubit, dict):
+        fits_by_qubit = {}
+    names = sorted(
+        {str(name) for name in metrics_by_qubit}
+        | {str(name) for name in fits_by_qubit}
+    )
+    per_qubit: dict[str, dict[str, Any]] = {}
+    for name in names:
+        digest: dict[str, Any] = {}
+        metrics = metrics_by_qubit.get(name) if isinstance(metrics_by_qubit, dict) else None
+        if isinstance(metrics, dict):
+            for key in _DIGEST_METRIC_KEYS:
+                if key in metrics:
+                    digest[key] = _json_safe(metrics[key])
+        fit = fits_by_qubit.get(name) if isinstance(fits_by_qubit, dict) else None
+        if isinstance(fit, dict):
+            for key in _DIGEST_FIT_KEYS:
+                if key in fit:
+                    digest[key] = _json_safe(fit[key])
+        if digest:
+            per_qubit[name] = digest
+    result: dict[str, Any] = {
+        "analysis_status": analysis.get("analysis_status"),
+        "node_id": analysis.get("node_id"),
+        "qubits": per_qubit,
+    }
+    for key in (
+        "passing_targets",
+        "failure_reasons_by_target",
+        "run_level_failure_reasons",
+        "03a_stage",
+    ):
+        if key in analysis:
+            result[key] = analysis[key]
+    if analysis.get("analysis_status") == "failed":
+        result["failure_reasons"] = analysis.get("failure_reasons", [])
+        if analysis.get("failure_category"):
+            result["failure_category"] = analysis["failure_category"]
+    return result
+
+
+def _attribute_failures(
+    failures: list[str], targets: list[str]
+) -> tuple[dict[str, list[str]], list[str]]:
+    """Split failure reasons into per-target reasons and run-level reasons.
+
+    Every per-qubit check in this module writes its reason as ``f"{name} ..."``.
+    A reason that names no target belongs to the run as a whole -- a missing
+    plot, an unreadable dataset, an invalid recorded update -- and must keep
+    blocking every target.
+    """
+
+    by_target: dict[str, list[str]] = {}
+    run_level: list[str] = []
+    names = sorted({str(name) for name in targets}, key=len, reverse=True)
+    for reason in failures:
+        text = str(reason)
+        for name in names:
+            if text.startswith(f"{name} "):
+                by_target.setdefault(name, []).append(text)
+                break
+        else:
+            run_level.append(text)
+    return by_target, run_level
 
 
 def _reset_type(parameters: Any) -> str:

@@ -1,5 +1,24 @@
 # Update log / 更新紀錄
 
+## 2026-09-20
+
+- Dashboard 版面調整：暫停排程、繼續排程、結束自動授權與緊急停止 worker 從
+  「結果與控制」頁移到首頁，排在狀態卡下方、完整關機卡上方；第三個分頁因此
+  改名為「實驗結果」。結果頁最上方新增「結果摘要」：依序列出本次服務的
+  `實驗N: <node>`，只有在 JY 判定該 run 通過、且節點回報該 qubit 為 successful
+  時，才在右側寫出成功的 qubit 並附上該次實驗的結果圖縮圖（最多 6 張，其餘
+  以數量標註）。未成功或進行中的實驗仍會列出，但右側不放 qubit 與圖。點任一
+  列或縮圖會跳到下方該次實驗的完整面板。
+- Dashboard layout: pause, resume, end-automation, and emergency-stop-worker
+  moved from the results page to Home, between the status card and full
+  shutdown, so the third tab is now named Experiment results. The results page
+  opens with a new result summary that lists `Experiment N: <node>` in order.
+  Successful qubits and result-plot thumbnails (capped at six, with the
+  remainder noted) appear only when JY passed the run and the node also
+  reported that qubit as successful. Unsuccessful and in-progress experiments
+  keep their row without qubits or plots. Selecting a row or thumbnail opens
+  that experiment's full panel below.
+
 ## 2026-09-06
 
 - 取消 `02x`/`02a` fixed full-batch retry：與其他節點相同，第一次全目標 multiplex，

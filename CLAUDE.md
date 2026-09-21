@@ -24,7 +24,12 @@ turn; if the host pauses, resume the same session after the operator sends
 `已核准`. Return only the entry result's top-level
 `browser_url`; approval and control URL fields are aliases for that same shared
 Dashboard service, not additional websites. The common `/` entry links to the
-session Home, Approval, and Results & controls pages.
+session Home, Approval, and Experiment results pages.
+After `已核准`, the next reply starts with `已核准`. A paused measurement-mode
+turn copies `operator_handoff.chat` as a three-item markdown list, never as one
+paragraph, including the shutdown hint.
+A live turn may execute `結束量測` directly; a paused or disconnected turn
+needs Dashboard Home shutdown first, then `結束量測` to verify.
 Never approve on the operator's behalf or bypass JY policies.
 
 For configured stop/exit phrases, persist full shutdown, cooperatively stop or
