@@ -1403,7 +1403,11 @@ class AnalysisTests(unittest.TestCase):
     def test_07b_sparse_tail_fails_p99_rule_without_axis_elongation(self) -> None:
         with tempfile.TemporaryDirectory() as folder:
             settings = make_settings(Path(folder), sample_state(0.2, 0.1))
-            analyzer = SnapshotAnalyzer(settings, PolicyEngine(settings))
+            policy = PolicyEngine(settings)
+            # The radius rule is kept behind morphology_mode; the default is
+            # now "two_blob" (operator instruction 2026-10-02).
+            policy.raw["analysis"]["07b"]["morphology_mode"] = "radius"
+            analyzer = SnapshotAnalyzer(settings, policy)
             rng = np.random.default_rng(17)
             samples = 10_000
             ground = rng.normal(0.0, 0.12, size=(samples, 2))

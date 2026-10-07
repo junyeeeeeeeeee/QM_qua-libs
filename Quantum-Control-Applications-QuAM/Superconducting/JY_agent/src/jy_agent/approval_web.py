@@ -4,6 +4,7 @@ import asyncio
 import getpass
 import ipaddress
 import json
+import math
 import re
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -24,8 +25,12 @@ from .service import AgentService, ServiceError
 
 
 MAX_FORM_BYTES = 4096
+# Confirmation, token and ids plus the lease-page checkboxes and mode choice.
+MAX_APPROVAL_FORM_FIELDS = 16
 SUMMARY_THUMBNAIL_LIMIT = 6
 TAIPEI_TIMEZONE = timezone(timedelta(hours=8), name="Asia/Taipei")
+CACHEABLE_ASSET_CACHE_CONTROL = "private, max-age=604800, immutable"
+
 SECURITY_HEADERS = {
     "Cache-Control": "no-store",
     "Content-Security-Policy": (
@@ -36,6 +41,11 @@ SECURITY_HEADERS = {
     "Referrer-Policy": "same-origin",
     "X-Content-Type-Options": "nosniff",
     "X-Frame-Options": "DENY",
+}
+
+CACHEABLE_ASSET_HEADERS = {
+    **SECURITY_HEADERS,
+    "Cache-Control": CACHEABLE_ASSET_CACHE_CONTROL,
 }
 
 AUTONOMY_EVENTS_SCRIPT = """(() => {
@@ -92,6 +102,8 @@ SESSION_DASHBOARD_SCRIPT = """(() => {
 
 DASHBOARD_EVENT_TYPES = {
     "home": None,
+    # Operator request 2026-10-03: model / token / estimated-cost page.
+    "usage": {"run_started", "run_analyzed", "decision_recorded"},
     "approval": {
         "proposal_created",
         "proposal_approved",
@@ -335,7 +347,7 @@ async def handle_browser_approval(
             body.decode("utf-8"),
             keep_blank_values=True,
             strict_parsing=True,
-            max_num_fields=4,
+            max_num_fields=MAX_APPROVAL_FORM_FIELDS,
         )
         approved = service.approve_from_browser(
             proposal_id,
@@ -344,6 +356,7 @@ async def handle_browser_approval(
             request.client.host if request.client is not None else "",
             actor=principal.actor,
             approval_method=principal.method,
+            lease_options=_lease_options_from_fields(fields, proposal),
         )
     except (UnicodeDecodeError, ValueError, ServiceError) as exc:
         return _proposal_page(
@@ -678,13 +691,14 @@ async def handle_session_dashboard(
             body.decode("utf-8"),
             keep_blank_values=True,
             strict_parsing=True,
-            max_num_fields=5,
+            max_num_fields=MAX_APPROVAL_FORM_FIELDS,
         )
         operation = _single_field(fields, "operation")
         if view is not None and operation not in {
             "home": {"shutdown", "control"},
             "approval": {"approve"},
             "results": set(),
+            "usage": set(),
         }[resolved_view]:
             raise ServiceError("This control does not belong to the current Dashboard page.")
         if operation == "approve":
@@ -700,6 +714,7 @@ async def handle_session_dashboard(
                 request.client.host if request.client is not None else "",
                 actor=principal.actor,
                 approval_method=principal.method,
+                lease_options=_lease_options_from_fields(fields, pending),
             )
             if str(review.get("session", {}).get("mode")) == "autonomous":
                 success = _ui(
@@ -782,7 +797,11 @@ async def handle_session_dashboard_asset(
         session_id = str(request.path_params.get("session_id", ""))
         asset_index = int(str(request.path_params.get("asset_index", "")))
         path = service.dashboard_review_asset(session_id, asset_index)
-    except (ValueError, ServiceError):
+        version = request.query_params.get("v")
+        current = _asset_version(path)
+        if request.query_params.get("thumb") == "1":
+            path = service.dashboard_asset_thumbnail(path)
+    except (ValueError, ServiceError, OSError):
         return _message_page(
             _ui(language, "找不到結果圖", "Result image not found"),
             _ui(
@@ -793,12 +812,32 @@ async def handle_session_dashboard_asset(
             status_code=404,
             language=language,
         )
+    # 2026-10-04: a versioned image URL names one immutable file, so the
+    # browser may keep it; refreshing the page then reloads only new plots.
+    headers = (
+        CACHEABLE_ASSET_HEADERS if version and version == current else SECURITY_HEADERS
+    )
     return FileResponse(
         path,
         filename=path.name,
         content_disposition_type="inline",
-        headers=SECURITY_HEADERS,
+        headers=headers,
     )
+
+
+def _asset_version(path: Any) -> str:
+    from .service import _asset_token
+
+    return _asset_token(path)
+
+
+def _asset_url(session_id: str, item: dict[str, Any], position: int, *, thumb: bool = False) -> str:
+    index = item.get("asset_indices", [])[position]
+    tokens = item.get("asset_tokens") or []
+    query = f"?v={tokens[position]}" if position < len(tokens) else ""
+    if thumb:
+        query += ("&" if query else "?") + "thumb=1"
+    return f"/session/{escape(session_id)}/assets/{index}{escape(query)}"
 
 
 async def handle_session_dashboard_script(request: Request) -> Response:
@@ -928,6 +967,7 @@ def _session_dashboard_page(
             <input type="hidden" name="operation" value="approve">
             <input type="hidden" name="proposal_id" value="{escape(proposal_id)}">
             <input type="hidden" name="csrf_token" value="{escape(csrf)}">
+            {_lease_options_fields(pending, language)}
             <label for="confirmation">{_ui(language, '核准文字', 'Confirmation')}</label>
             <input id="confirmation" name="confirmation" type="text"
                    autocomplete="off" autocapitalize="off" spellcheck="false" required>
@@ -948,6 +988,7 @@ def _session_dashboard_page(
             <dt>{_ui(language, '狀態', 'Status')}</dt><dd>{escape(_localized_enum(language, authorization.get('status')))}</dd>
             <dt>{_ui(language, '目標', 'Targets')}</dt><dd>{escape(', '.join(authorization.get('targets', [])))}</dd>
             <dt>{_ui(language, '允許的節點', 'Allowed nodes')}</dt><dd>{escape(', '.join(authorization.get('allowed_nodes', [])))}</dd>
+            {_workflow_options_rows(workflow, language)}
             <dt>{_ui(language, '每個節點／qubit 上限', 'Per node/qubit limit')}</dt><dd>{escape(str(authorization.get('max_attempts_per_node_qubit')))}</dd>
             <dt>{_ui(language, '到期時間', 'Expires')}</dt><dd>{escape(_format_taipei_time(authorization.get('expires_at')))}</dd>
           </dl>
@@ -1044,11 +1085,13 @@ def _session_dashboard_page(
     home_path = f"/session/{session_id}/home?lang={language}"
     approval_path = f"/session/{session_id}/approval?lang={language}"
     results_path = f"/session/{session_id}/results?lang={language}"
+    usage_path = f"/session/{session_id}/usage?lang={language}"
     nav = f"""
     <nav class="dashboard-nav" aria-label="{_ui(language, 'Dashboard 分頁', 'Dashboard pages')}">
       <a class="{'active' if view == 'home' else ''}" href="{escape(home_path)}">{_ui(language, '首頁', 'Home')}</a>
       <a class="{'active' if view == 'approval' else ''}" href="{escape(approval_path)}">{_ui(language, '核准', 'Approval')} <span class="badge">{pending_count}</span></a>
       <a class="{'active' if view == 'results' else ''}" href="{escape(results_path)}">{_ui(language, '實驗結果', 'Experiment results')} <span class="badge">{result_count}</span></a>
+      <a class="{'active' if view == 'usage' else ''}" href="{escape(usage_path)}">{_ui(language, 'Token 用量', 'Token usage')}</a>
     </nav>"""
     status_html = f"""
     <section class="card"><dl>
@@ -1078,6 +1121,10 @@ def _session_dashboard_page(
         page_title = _ui(language, "JY 核准", "JY approval")
         page_intro = _ui(language, "此頁只處理待核准動作；新提案出現時才會自動更新。", "This page is only for pending approvals and refreshes when a proposal changes.")
         page_content = approval_html
+    elif view == "usage":
+        page_title = _ui(language, "JY Token 用量", "JY token usage")
+        page_intro = _ui(language, "每個實驗使用的模型、token 數與估計費用，從本機 Claude Code 對話紀錄統計（只讀取數字）。", "Model, tokens and estimated cost per experiment, counted from the local Claude Code transcripts (numbers only).")
+        page_content = _usage_section(service, str(workflow["id"]), language)
     elif view == "results":
         page_title = _ui(language, "JY 實驗結果", "JY experiment results")
         page_intro = _ui(language, "所有實驗結果會保留到服務關閉；此頁只在結果或判斷改變時更新。暫停、停止與關機控制已移到首頁。", "All results remain until the service closes. This page refreshes only for results or decisions. Pause, stop, and shutdown controls are on the Home page.")
@@ -1132,8 +1179,17 @@ button {{ margin-top:12px; border:0; color:white; background:#3568e8; font-weigh
 .warning {{ padding:12px; border-radius:8px; background:#5b3a12; color:#ffe7b0; }}
 .instrument-alert {{ border-color:#f0a93b; background:#3b2b15; }}
 .confirmation {{ display:block; padding:12px; background:#070d18; border-radius:8px; user-select:all; overflow-wrap:anywhere; }}
+.lease-options {{ border:1px solid #2b3b5d; border-radius:10px; padding:10px 14px; margin:14px 0; }} .lease-options legend {{ padding:0 6px; font-weight:700; }} .lease-options .choice {{ display:flex; gap:10px; align-items:flex-start; margin:8px 0; }} .lease-options .choice input {{ width:auto; margin-top:5px; flex:none; }} .warning {{ color:#ffd479; }}
 .notice {{ padding:12px; border-radius:8px; }} .error {{ background:#5a1e2a; }} .success {{ background:#14532d; }}
-.dashboard-nav {{ display:grid; grid-template-columns:repeat(3,1fr); gap:10px; margin:18px 0; }}
+.dashboard-nav {{ display:grid; grid-template-columns:repeat(4,1fr); gap:10px; margin:18px 0; }}
+.usage-table {{ width:100%; border-collapse:collapse; font-size:.9rem; font-variant-numeric:tabular-nums; }}
+.usage-table th,.usage-table td {{ padding:6px 8px; border-top:1px solid #21304d; text-align:right; white-space:nowrap; }}
+.usage-table th:first-child,.usage-table td:first-child,.usage-table td.text,.usage-table th.text {{ text-align:left; }}
+.usage-table th {{ color:#9fb2d7; font-weight:600; }}
+.table-scroll {{ overflow-x:auto; }}
+.usage-totals {{ display:grid; grid-template-columns:repeat(auto-fit,minmax(150px,1fr)); gap:10px; }}
+.usage-totals div {{ background:#070d18; border-radius:10px; padding:10px 12px; }}
+.usage-totals strong {{ display:block; font-size:1.25rem; }}
 .dashboard-nav a {{ color:#cfe0ff; background:#121d31; border:1px solid #2b3b5d; border-radius:10px; padding:12px; text-align:center; text-decoration:none; }}
 .dashboard-nav a.active {{ background:#234b9d; border-color:#7ba2ff; color:white; }}
 .badge {{ display:inline-block; min-width:1.5em; margin-left:4px; padding:0 .4em; border-radius:999px; background:#07101f; }}
@@ -1149,6 +1205,118 @@ button {{ margin-top:12px; border:0; color:white; background:#3568e8; font-weigh
 {page_content}
 </main></body></html>"""
     return HTMLResponse(html, status_code=status_code, headers=SECURITY_HEADERS)
+
+
+MODEL_LABELS = {
+    "claude-opus-5-5": "Opus 5.5",
+    "claude-sonnet-5-5": "Sonnet 5.5",
+    "claude-fable-5-1": "Fable 5.1",
+    "claude-haiku-4-5": "Haiku 4.5",
+}
+
+
+def _usage_section(service: AgentService, workflow_id: str, language: str) -> str:
+    """Per-run model, token and estimated-cost table (2026-10-03)."""
+    try:
+        usage = service.workflow_usage(workflow_id)
+    except Exception as exc:  # the page must never break the Dashboard
+        return f'<section class="card"><p class="notice error">{escape(str(exc))}</p></section>'
+    if usage.get("error"):
+        return f'<section class="card"><p class="notice error">{escape(str(usage["error"]))}</p></section>'
+
+    def number(value: Any) -> str:
+        return f"{int(value):,}"
+
+    def dollars(bucket: dict[str, Any]) -> str:
+        text = f"${float(bucket.get('cost_usd', 0.0)):.2f}"
+        if bucket.get("unpriced_calls"):
+            text += "*"
+        return text
+
+    def models(bucket: dict[str, Any]) -> str:
+        return ", ".join(
+            MODEL_LABELS.get(name, name) for name in sorted(bucket.get("models", {}))
+        ) or "-"
+
+    def cells(bucket: dict[str, Any]) -> str:
+        writes = bucket.get("cache_write_5m", 0) + bucket.get("cache_write_1h", 0)
+        return (
+            f'<td class="text">{escape(models(bucket))}</td>'
+            f"<td>{number(bucket.get('calls', 0))}</td>"
+            f"<td>{number(bucket.get('output', 0))}</td>"
+            f"<td>{number(bucket.get('input', 0))}</td>"
+            f"<td>{number(writes)}</td>"
+            f"<td>{number(bucket.get('cache_read', 0))}</td>"
+            f"<td>{dollars(bucket)}</td>"
+        )
+
+    head = (
+        f'<th class="text">{_ui(language, "模型", "Model")}</th>'
+        f"<th>{_ui(language, '呼叫', 'Calls')}</th>"
+        f"<th>Output</th><th>Input</th>"
+        f"<th>{_ui(language, 'Cache 寫入', 'Cache write')}</th>"
+        f"<th>{_ui(language, 'Cache 讀取', 'Cache read')}</th>"
+        f"<th>{_ui(language, '估計費用', 'Est. cost')}</th>"
+    )
+    total = usage["total"]
+    measurement_cost = sum(float(row["cost_usd"]) for row in usage["runs"])
+    totals = f"""
+    <section class="card"><h2>{_ui(language, '總計', 'Totals')}</h2>
+    <div class="usage-totals">
+      <div><span class="muted">{_ui(language, '估計總費用', 'Estimated total')}</span><strong>{dollars(total)}</strong></div>
+      <div><span class="muted">{_ui(language, '實驗部分', 'Experiments')}</span><strong>${measurement_cost:.2f}</strong></div>
+      <div><span class="muted">{_ui(language, '程式開發', 'Development')}</span><strong>{dollars(usage['development'])}</strong></div>
+      <div><span class="muted">{_ui(language, '對話／其他', 'Conversation')}</span><strong>{dollars(usage['conversation'])}</strong></div>
+      <div><span class="muted">{_ui(language, '模型', 'Models')}</span><strong>{escape(models(total))}</strong></div>
+      <div><span class="muted">Output tokens</span><strong>{number(total['output'])}</strong></div>
+    </div></section>"""
+
+    node_rows = "".join(
+        f'<tr><td class="text">{escape(node)}</td><td>{number(bucket["runs"])}</td>{cells(bucket)}</tr>'
+        for node, bucket in usage["nodes"].items()
+    )
+    nodes = f"""
+    <section class="card"><h2>{_ui(language, '依節點', 'By node')}</h2>
+    <div class="table-scroll"><table class="usage-table">
+    <tr><th class="text">{_ui(language, '節點', 'Node')}</th><th>Runs</th>{head}</tr>
+    {node_rows}
+    </table></div></section>"""
+
+    run_rows = "".join(
+        f'<tr><td class="text">{escape(_format_taipei_time(row["started_at"]))}</td>'
+        f'<td class="text">{escape(row["node_id"])}</td>'
+        f'<td class="text">{escape(",".join(row["qubits"]))}</td>{cells(row)}</tr>'
+        for row in usage["runs"]
+    )
+    other_rows = "".join(
+        f'<tr><td class="text" colspan="3">{label}</td>{cells(usage[key])}</tr>'
+        for key, label in (
+            ("setup", _ui(language, "量測開始前（進入、等待核准）", "Before the first run (entry, approval)")),
+            ("development", _ui(language, "程式開發（修改檔案的呼叫）", "Development (calls that edit files)")),
+            ("conversation", _ui(language, "對話／其他", "Conversation / other")),
+        )
+    )
+    runs = f"""
+    <section class="card"><h2>{_ui(language, '依實驗', 'By experiment')}</h2>
+    <div class="table-scroll"><table class="usage-table">
+    <tr><th class="text">{_ui(language, '開始時間', 'Started')}</th><th class="text">{_ui(language, '節點', 'Node')}</th><th class="text">Qubits</th>{head}</tr>
+    {run_rows}{other_rows}
+    </table></div></section>"""
+
+    pricing = usage.get("pricing", {}).get("models", {})
+    price_text = "; ".join(
+        f"{MODEL_LABELS.get(name, name)} ${float(p['input']):g}/${float(p['output']):g} (cache read ${float(p['cache_read']):g})"
+        for name, p in pricing.items()
+    )
+    notes = f"""
+    <section class="card"><h2>{_ui(language, '計算方式', 'How this is counted')}</h2>
+    <ul class="muted">
+      <li>{_ui(language, '一次呼叫歸給它發生時正在進行的實驗（從該實驗開始到下一個實驗開始），包含啟動、等待、分析、決策與 commit；修改檔案的呼叫算程式開發。', 'A call belongs to the experiment in progress when it happened (from that run start to the next), covering start, waiting, analysis, decision and commit; calls that edit files count as development.')}</li>
+      <li>{_ui(language, '估計費用採 Anthropic API 公開價格（每百萬 token，USD）：', 'Estimated cost uses Anthropic API list prices (USD per million tokens): ')}{escape(price_text)}{_ui(language, '；cache 寫入為 input 價格的 1.25 倍（5 分鐘）或 2 倍（1 小時）。訂閱方案的實際計費方式不同，這裡是 API 等值費用。', '; cache writes cost 1.25x (5 min) or 2x (1 h) the input price. Subscription plans are billed differently; this is the API-equivalent cost.')}</li>
+      <li>{_ui(language, 'Cache 讀取通常最大：每次呼叫都會重新送出整段對話。標 * 的列含沒有價格的模型。', 'Cache reads are usually the largest column because every call resends the whole conversation. Rows marked * include a model without a price.')}</li>
+      <li>{_ui(language, '資料來源', 'Source')}: {escape(str(usage.get('transcript_dir')))}</li>
+    </ul></section>"""
+    return totals + nodes + runs + notes
 
 
 def _instrument_pause_notice(
@@ -1271,10 +1439,10 @@ def _session_summary_section(
             shown = asset_indices[:SUMMARY_THUMBNAIL_LIMIT]
             thumbnails = "".join(
                 f'<a href="{target}" data-experiment-link="{ordinal}">'
-                f'<img src="/session/{escape(session_id)}/assets/{asset_index}" '
+                f'<img src="{_asset_url(session_id, item, plot_number - 1, thumb=True)}" '
                 f'alt="{escape(_ui(language, "實驗結果圖", "Experiment result plot"))} {ordinal}-{plot_number}" '
                 f'loading="lazy"></a>'
-                for plot_number, asset_index in enumerate(shown, start=1)
+                for plot_number, _asset_index in enumerate(shown, start=1)
             )
             if thumbnails:
                 remaining = len(asset_indices) - len(shown)
@@ -1337,10 +1505,10 @@ def _session_history_section(
         analysis = item.get("analysis") or {}
         decision = item.get("decision") or {}
         figures = "".join(
-            f'<figure><img src="/session/{escape(session_id)}/assets/{asset_index}" '
+            f'<figure><img src="{_asset_url(session_id, item, plot_number - 1)}" '
             f'alt="{escape(_ui(language, "實驗結果圖", "Experiment result plot"))} {ordinal}-{plot_number}" loading="lazy">'
             f'<figcaption>{_ui(language, "結果圖", "Plot")} {plot_number}</figcaption></figure>'
-            for plot_number, asset_index in enumerate(
+            for plot_number, _asset_index in enumerate(
                 item.get("asset_indices", []), start=1
             )
         )
@@ -1580,6 +1748,7 @@ def _proposal_page(
           <code class="confirmation">{escape(confirmation)}</code>
           <form method="post" action="/approve/{escape(proposal_id)}?lang={escape(language)}">
             <input type="hidden" name="csrf_token" value="{escape(csrf_token)}">
+            {_lease_options_fields(proposal, language)}
             <label for="confirmation">{_ui(language, '核准文字', 'Confirmation')}</label>
             <input id="confirmation" name="confirmation" type="text"
                    autocomplete="off" autocapitalize="off" spellcheck="false" required>
@@ -1649,6 +1818,7 @@ def _proposal_page(
     .notice {{ padding: 14px; border-radius: 8px; }}
     a {{ color: #8ab4ff; }}
     .error {{ background: #5a1e2a; }} .success {{ background: #14532d; }}
+    .lease-options {{ border:1px solid #2b3b5d; border-radius:10px; padding:10px 14px; margin:14px 0; }} .lease-options legend {{ padding:0 6px; font-weight:700; }} .lease-options .choice {{ display:flex; gap:10px; align-items:flex-start; margin:8px 0; }} .lease-options .choice input {{ width:auto; margin-top:5px; flex:none; }}
     .warning {{ color: #ffd479; }} .muted {{ color: #9fb2d7; }}
     details summary {{ cursor: pointer; font-weight: 700; }}
     @media (max-width: 600px) {{
@@ -1917,6 +2087,244 @@ def _has_trusted_submission_source(
         return True
 
     return False
+
+
+# Operator request 2026-10-04: labels for the optional nodes on the lease page.
+OPTIONAL_NODE_LABELS = {
+    "02": ("02 寬頻共振腔掃描（Broadband spectroscopy，02x 之前）", "02 Broadband spectroscopy (before 02x)"),
+    "05st": ("05st T1 統計", "05st T1 statistics"),
+    "06st_t2star": ("06st T2* 統計", "06st T2* statistics"),
+    "06st_t2e": ("06st T2 echo 統計", "06st T2 echo statistics"),
+}
+
+
+def _lease_option_offer(proposal: dict[str, Any]) -> dict[str, Any] | None:
+    if str(proposal.get("kind")) != "autonomy_lease":
+        return None
+    offer = (proposal.get("payload") or {}).get("workflow_options_offer")
+    return offer if isinstance(offer, dict) else None
+
+
+def _lease_options_fields(proposal: dict[str, Any], language: str) -> str:
+    """Checkboxes and the measurement-mode choice for an autonomy lease.
+
+    Operator request 2026-10-04: automatic measurement starts only after the
+    operator has chosen which optional experiments run and whether the qubits
+    are measured one at a time or multiplexed.
+    """
+
+    offer = _lease_option_offer(proposal)
+    if offer is None:
+        return ""
+    parts: list[str] = []
+    optional = [
+        item for item in offer.get("optional_nodes", []) if isinstance(item, dict)
+    ]
+    if optional:
+        boxes = []
+        for item in optional:
+            node = str(item.get("node"))
+            zh, en = OPTIONAL_NODE_LABELS.get(node, (node, node))
+            checked = " checked" if item.get("default", True) else ""
+            box = (
+                f'<label class="choice"><input type="checkbox" name="optional_node" '
+                f'value="{escape(node)}"{checked}> {escape(_ui(language, zh, en))}</label>'
+            )
+            if node == "02":
+                box = (
+                    f'<div class="optional-node">{box}'
+                    f"{_broadband_parameter_fields(item.get('parameters'), language)}</div>"
+                )
+            boxes.append(box)
+        parts.append(
+            f"""<fieldset class="lease-options">
+              <legend>{_ui(language, '額外實驗（勾選後才會執行）', 'Optional experiments (run only when ticked)')}</legend>
+              {''.join(boxes)}
+            </fieldset>"""
+        )
+    drive = offer.get("drive_mode")
+    if isinstance(drive, dict):
+        first = escape(str(drive.get("serialize_from_node") or "03a"))
+        groups = drive.get("shared_xy_drive_groups") or {}
+        recommended = drive.get("recommended")
+        locked = drive.get("locked")
+        if groups:
+            shared = "; ".join(
+                f"{escape(str(output).split('/ports/')[-1])} → {escape(', '.join(names))}"
+                for output, names in sorted(groups.items())
+            )
+            detected = _ui(
+                language,
+                f"偵測到 wiring 中多個 qubit 共用同一個 XY 輸出（共用 LO）：{shared}。{first} 之後建議一顆一顆量。",
+                f"The wiring routes several qubits to one XY output (shared LO): {shared}. One qubit at a time is recommended from {first} on.",
+            )
+        else:
+            detected = _ui(
+                language,
+                f"每個 qubit 都有自己的 XY 輸出；{first} 之後建議 multiplex 量測。",
+                f"Every qubit has its own XY output; multiplexed measurement is recommended from {first} on.",
+            )
+        choices = (
+            (
+                "per_qubit",
+                _ui(language, f"一顆一顆量：每顆 qubit 單獨走完 {first} 之後的全部實驗，再換下一顆", f"One qubit at a time: each qubit goes through every node from {first} on before the next one starts"),
+            ),
+            (
+                "multiplex",
+                _ui(language, f"Multiplex：{first} 之後每個實驗同時量所有 qubit", f"Multiplexed: every node from {first} on measures all qubits together"),
+            ),
+        )
+        radios = []
+        for value, label in choices:
+            mark = (
+                _ui(language, "（建議）", " (recommended)") if value == recommended else ""
+            )
+            checked = " checked" if locked == value else ""
+            disabled = " disabled" if locked is not None and locked != value else ""
+            radios.append(
+                f'<label class="choice"><input type="radio" name="drive_mode" '
+                f'value="{value}" required{checked}{disabled}> {escape(label)}{mark}</label>'
+            )
+        locked_note = (
+            f'<p class="muted">{_ui(language, "此工作流程已選定量測方式，不能在中途更改。", "This workflow already chose its measurement mode; it cannot change mid-workflow.")}</p>'
+            if locked is not None
+            else ""
+        )
+        warning = (
+            f'<p class="warning">{_ui(language, "共用 XY 輸出時選 multiplex：同一條線上的 qubit 共用 LO，JY 不會為個別 qubit 移動該 LO。", "Multiplexed on a shared XY output: qubits on that line share one LO, and JY will not move it for an individual qubit.")}</p>'
+            if groups
+            else ""
+        )
+        parts.append(
+            f"""<fieldset class="lease-options">
+              <legend>{_ui(language, '量測方式（必選）', 'Measurement mode (required)')}</legend>
+              <p>{detected}</p>
+              {''.join(radios)}
+              {locked_note}
+              {warning}
+            </fieldset>"""
+        )
+    return "\n".join(parts)
+
+
+def _broadband_parameter_fields(stored: Any, language: str) -> str:
+    """res_num and res_design_freq inputs shown while 02 is ticked.
+
+    Operator request 2026-10-07: 02 needs the expected resonator count and
+    design frequencies. The page CSP allows no inline script, so `:has()`
+    hides the inputs while 02 is unticked; a browser without `:has()` simply
+    always shows them.
+    """
+
+    stored = stored if isinstance(stored, dict) else {}
+    res_num = stored.get("res_num")
+    design = stored.get("res_design_freq") or []
+    design_text = ", ".join(
+        f"{(float(value) / 1e9 if float(value) >= 1e6 else float(value)):g}"
+        for value in design
+    )
+    return f"""<style>
+      .optional-node:not(:has(input[name="optional_node"]:checked)) .node-parameters {{ display: none; }}
+      .node-parameters {{ margin: .25rem 0 .75rem 1.75rem; display: grid; gap: .4rem; }}
+      .node-parameters input[type=text], .node-parameters input[type=number] {{ width: 100%; max-width: 36rem; padding: .35rem; }}
+    </style>
+    <div class="node-parameters">
+      <label>{_ui(language, '共振腔數量 res_num（q1..qn 的 n）', 'Number of resonators res_num (n of q1..qn)')}
+        <input type="number" name="node02_res_num" min="1" step="1" value="{escape(str(res_num)) if res_num is not None else ''}"></label>
+      <label>{_ui(language, '設計頻率 res_design_freq（GHz，依 q1..qn 順序，以逗號分隔，個數須等於 res_num）', 'Design frequencies res_design_freq (GHz, q1..qn order, comma-separated, res_num entries)')}
+        <input type="text" name="node02_res_design_freq" placeholder="5.95, 6.02, 6.10" value="{escape(design_text)}"></label>
+      <p class="muted">{_ui(language, '勾選 02 時兩欄都必填。', 'Both fields are required while 02 is ticked.')}</p>
+    </div>"""
+
+
+def _broadband_parameters_from_fields(fields: dict[str, list[str]]) -> dict[str, Any]:
+    """Parse the 02 inputs; both are required while 02 is ticked."""
+
+    def one(name: str) -> str:
+        values = fields.get(name, [])
+        if len(values) > 1:
+            raise ServiceError(f"The form sent {name} more than once.")
+        return values[0].strip() if values else ""
+
+    num_text = one("node02_res_num")
+    design_text = one("node02_res_design_freq")
+    if not num_text or not design_text:
+        raise ServiceError(
+            "02 is ticked: fill in both res_num and res_design_freq, or untick 02."
+        )
+    try:
+        res_num = int(num_text)
+    except ValueError:
+        raise ServiceError(f"res_num must be a whole number, not {num_text!r}.") from None
+    if res_num < 1:
+        raise ServiceError("res_num must be at least 1.")
+    try:
+        design = [
+            float(value)
+            for value in design_text.replace("，", ",").replace(" ", ",").split(",")
+            if value
+        ]
+    except ValueError:
+        raise ServiceError(
+            f"res_design_freq must be comma-separated numbers in GHz, not {design_text!r}."
+        ) from None
+    if not all(math.isfinite(value) and value > 0 for value in design):
+        raise ServiceError("Every res_design_freq entry must be a positive frequency.")
+    if len(design) != res_num:
+        raise ServiceError(
+            f"res_design_freq has {len(design)} entries but res_num is {res_num}."
+        )
+    return {"res_num": res_num, "res_design_freq": design}
+
+
+def _workflow_options_rows(workflow: Any, language: str) -> str:
+    """The lease-page choices in force for this workflow."""
+
+    options = workflow.get("options") if isinstance(workflow, dict) else None
+    if not isinstance(options, dict) or not options:
+        return ""
+    mode = options.get("drive_mode")
+    mode_text = {
+        "per_qubit": _ui(language, "一顆一顆量", "One qubit at a time"),
+        "multiplex": _ui(language, "Multiplex", "Multiplexed"),
+    }.get(str(mode), _ui(language, "依 wiring 判斷", "From the wiring"))
+    skipped = ", ".join(str(node) for node in options.get("excluded_nodes", [])) or _ui(
+        language, "無", "None"
+    )
+    rows = (
+        f"<dt>{_ui(language, '量測方式', 'Measurement mode')}</dt><dd>{escape(mode_text)}</dd>"
+        f"<dt>{_ui(language, '未勾選的實驗', 'Unticked experiments')}</dt><dd>{escape(skipped)}</dd>"
+    )
+    broadband = (options.get("node_parameters") or {}).get("02")
+    if isinstance(broadband, dict):
+        design = ", ".join(f"{value:g}" for value in broadband.get("res_design_freq", []))
+        rows += (
+            f"<dt>{_ui(language, '02 參數', '02 parameters')}</dt>"
+            f"<dd>res_num = {escape(str(broadband.get('res_num')))}; "
+            f"res_design_freq = [{escape(design)}] GHz</dd>"
+        )
+    return rows
+
+
+def _lease_options_from_fields(
+    fields: dict[str, list[str]], proposal: dict[str, Any] | None
+) -> dict[str, Any] | None:
+    """The lease-page choices, or None when this form had none to make."""
+
+    if proposal is None or _lease_option_offer(proposal) is None:
+        return None
+    modes = fields.get("drive_mode", [])
+    if len(modes) > 1:
+        raise ServiceError("Choose exactly one measurement mode.")
+    selected = list(fields.get("optional_node", []))
+    node_parameters = (
+        {"02": _broadband_parameters_from_fields(fields)} if "02" in selected else {}
+    )
+    return {
+        "optional_nodes": selected,
+        "drive_mode": modes[0] if modes else None,
+        "node_parameters": node_parameters,
+    }
 
 
 def _single_field(fields: dict[str, list[str]], name: str) -> str:

@@ -1020,7 +1020,8 @@ class SinglePassNodeTests(unittest.TestCase):
                 "07d_Readout_Frequency_Duration_Power_Optimization.py",
             )
             defaults = definition["defaults"]
-            self.assertEqual(defaults["num_runs"], 40)
+            # 40 -> 100 on 2026-10-02 for the two-blob point selection.
+            self.assertEqual(defaults["num_runs"], 100)
             self.assertEqual(defaults["plotting_dimension"], "2D")
             self.assertTrue(defaults["multiplexed"])
             # Every default must satisfy its own declared validator.
@@ -1065,6 +1066,141 @@ class SinglePassNodeTests(unittest.TestCase):
                 )
             plan = service.next_action(workflow["id"])
             self.assertEqual(plan["action"], "record_decision")
+
+    def test_single_pass_failures_advance_and_stay_active(self) -> None:
+        """Operator choice 2026-10-03: q1/q2 failed 07b's blob test but carry
+        on to 06, which needs no state discrimination."""
+
+        with tempfile.TemporaryDirectory() as folder:
+            state, wiring, targets = sample_multiplex_state_and_wiring()
+            settings = make_settings(Path(folder), state)
+            atomic_write_json(settings.wiring_path, wiring)
+            service = AgentService(settings)
+            _with_readout_nodes(service)
+            workflow = start_test_workflow(service, targets)
+            service.db.execute(
+                "UPDATE workflows SET current_node = '07b' WHERE id = ?",
+                (workflow["id"],),
+            )
+            proposal = service.request_run(
+                workflow["id"], "07b", {"qubits": targets},
+                "The one 07b run.", "unittest",
+            )
+            passing = sorted(targets)[:4]
+            service.db.execute(
+                """
+                INSERT INTO runs(
+                    id, workflow_id, proposal_id, node_id, parameters_json,
+                    status, analysis_status, analysis_json
+                ) VALUES (?, ?, ?, '07b', ?, 'completed', 'needs_review', ?)
+                """,
+                (
+                    "offline-07b-partial",
+                    workflow["id"],
+                    proposal["id"],
+                    json.dumps({"qubits": targets}),
+                    json.dumps(
+                        {
+                            "passing_targets": passing,
+                            "fit_quality": {
+                                "results": {
+                                    name: {
+                                        "fit_successful": name in passing,
+                                        "readout_fidelity": 0.9 if name in passing else 0.7,
+                                    }
+                                    for name in targets
+                                }
+                            },
+                        }
+                    ),
+                ),
+            )
+            object.__setattr__(
+                service.settings,
+                "workflow_sequence",
+                (*service.settings.workflow_sequence, "06"),
+            )
+            service.record_decision(
+                workflow["id"],
+                "offline-07b-partial",
+                "advance",
+                "Single pass done; failures carry no update.",
+                "06",
+                None,
+                None,
+                "unittest",
+            )
+            refreshed = service._workflow(workflow["id"])
+            self.assertEqual(
+                service._active_targets_for_node(refreshed, "06"), set(targets)
+            )
+
+    def test_07d_runs_in_groups_of_at_most_four(self) -> None:
+        """Operator instruction 2026-09-29: the node's batching drops qubits
+        above four, so 07d covers its targets in capped groups."""
+
+        with tempfile.TemporaryDirectory() as folder:
+            state, wiring, targets = sample_multiplex_state_and_wiring()
+            settings = make_settings(Path(folder), state)
+            atomic_write_json(settings.wiring_path, wiring)
+            service = AgentService(settings)
+            _with_readout_nodes(service)
+            self.assertEqual(service._node_multiplex_cap("07d"), 4)
+            self.assertGreater(len(targets), 4)
+            workflow = service.start_workflow(
+                targets, {"multiplexed": True}, "unittest", ENTRY_PHRASE
+            )
+            service.db.execute(
+                "UPDATE workflows SET current_node = '07d' WHERE id = ?",
+                (workflow["id"],),
+            )
+            plan = service.next_action(workflow["id"])
+            self.assertEqual(plan["action"], "run")
+            self.assertEqual(plan["run"]["qubits"], sorted(targets)[:4])
+
+            with self.assertRaisesRegex(Exception, "at most 4 targets"):
+                service.request_run(
+                    workflow["id"], "07d", {"qubits": targets},
+                    "Full width exceeds the 07d cap.", "unittest",
+                )
+            first = sorted(targets)[:4]
+            proposal = service.request_run(
+                workflow["id"], "07d", {"qubits": first},
+                "First 07d group.", "unittest",
+            )
+            service.db.execute(
+                """
+                INSERT INTO runs(
+                    id, workflow_id, proposal_id, node_id, parameters_json,
+                    status, analysis_status
+                ) VALUES (?, ?, ?, '07d', ?, 'completed', 'needs_review')
+                """,
+                (
+                    "offline-07d-group-1",
+                    workflow["id"],
+                    proposal["id"],
+                    json.dumps({"qubits": first}),
+                ),
+            )
+            # The measured group is refused again; the rest is still open.
+            with self.assertRaisesRegex(Exception, "runs once per target"):
+                service.request_run(
+                    workflow["id"], "07d", {"qubits": first},
+                    "Remeasure the first group.", "unittest",
+                )
+            rest = sorted(set(targets) - set(first))
+            service.request_run(
+                workflow["id"], "07d", {"qubits": rest},
+                "Second 07d group.", "unittest",
+            )
+            # 07d stays out of SUBGROUP_NODES, so 07b still receives every
+            # target regardless of 07d's per-target evidence.
+            self.assertEqual(
+                service._active_targets_for_node(
+                    service._workflow(workflow["id"]), "07b"
+                ),
+                set(targets),
+            )
 
 
 class ActiveResetRepeatTests(unittest.TestCase):
@@ -1146,6 +1282,147 @@ class ActiveResetRepeatTests(unittest.TestCase):
             )
             self.assertEqual(
                 sorted(plan["run"]["qubits"]), sorted([targets[0], targets[1]])
+            )
+
+    def test_reset_groups_split_later_nodes(self) -> None:
+        """2026-10-04: qualified qubits run 06 with active reset, the rest
+        thermal, each group with its own shared first batch."""
+
+        with tempfile.TemporaryDirectory() as folder:
+            service, workflow, targets = self.build(folder)
+            # The live workflow is multiplexed; the shared-first-batch rule
+            # applies only then.
+            service.db.execute(
+                "UPDATE workflows SET initial_parameters_json = ? WHERE id = ?",
+                (json.dumps({"multiplexed": True}), workflow["id"]),
+            )
+            object.__setattr__(
+                service.settings,
+                "workflow_sequence",
+                (*service.settings.workflow_sequence, "06"),
+            )
+            qualified = sorted(targets)[:2]
+            proposal = service.request_run(
+                workflow["id"], "07b", {"qubits": targets},
+                "Thermal 07b.", "unittest",
+            )
+            service.db.execute(
+                """
+                INSERT INTO runs(
+                    id, workflow_id, proposal_id, node_id, parameters_json,
+                    status, analysis_status, analysis_json
+                ) VALUES (?, ?, ?, '07b', ?, 'completed', 'pass', ?)
+                """,
+                (
+                    "offline-07b-active-q",
+                    workflow["id"],
+                    proposal["id"],
+                    json.dumps(
+                        {"qubits": qualified, "reset_type_thermal_or_active": "active"}
+                    ),
+                    json.dumps(
+                        {
+                            "fit_quality": {
+                                "results": {
+                                    name: {
+                                        "fit_successful": True,
+                                        "active_reset_qualified": True,
+                                        "morphology_pass": True,
+                                        "readout_fidelity": 0.95,
+                                    }
+                                    for name in qualified
+                                }
+                            }
+                        }
+                    ),
+                ),
+            )
+            service.record_decision(
+                workflow["id"], "offline-07b-active-q", "repeat",
+                "Active repeat accepted.", None, None, None, "unittest",
+            )
+            service.db.execute(
+                "UPDATE workflows SET current_node = '06' WHERE id = ?",
+                (workflow["id"],),
+            )
+            current = service._workflow(workflow["id"])
+            groups = service._reset_groups(current, "06")
+            self.assertEqual(groups["active"], set(qualified))
+            self.assertEqual(groups["thermal"], set(targets) - set(qualified))
+
+            plan = service.next_action(workflow["id"])
+            self.assertEqual(plan["run"]["qubits"], qualified)
+            self.assertEqual(plan["run"]["parameters"]["reset_type"], "active")
+
+            # Mixing groups, or a partial first batch, is refused.
+            with self.assertRaises(Exception):
+                service.request_run(
+                    workflow["id"], "06",
+                    {"qubits": targets, "reset_type": "thermal"},
+                    "Everyone thermal.", "unittest",
+                )
+            with self.assertRaises(Exception):
+                service.request_run(
+                    workflow["id"], "06",
+                    {"qubits": qualified[:1], "reset_type": "active"},
+                    "Partial active batch.", "unittest",
+                )
+            service.request_run(
+                workflow["id"], "06",
+                {"qubits": qualified, "reset_type": "active"},
+                "Active group first batch.", "unittest",
+            )
+
+    def test_active_repeat_is_allowed_for_targets_that_passed(self) -> None:
+        """2026-10-03: the planner proposed the repeat for eight qubits that
+        had passed the thermal run, and the retry guard refused them."""
+
+        with tempfile.TemporaryDirectory() as folder:
+            service, workflow, targets = self.build(folder)
+            proposal = service.request_run(
+                workflow["id"], "07b", {"qubits": targets},
+                "The one thermal 07b run.", "unittest",
+            )
+            passing = sorted(targets)[:2]
+            service.db.execute(
+                """
+                INSERT INTO runs(
+                    id, workflow_id, proposal_id, node_id, parameters_json,
+                    status, analysis_status, analysis_json
+                ) VALUES (?, ?, ?, '07b', ?, 'completed', 'needs_review', ?)
+                """,
+                (
+                    "offline-07b-thermal-pass",
+                    workflow["id"],
+                    proposal["id"],
+                    json.dumps(
+                        {"qubits": targets, "reset_type_thermal_or_active": "thermal"}
+                    ),
+                    json.dumps(
+                        {
+                            "fit_quality": {
+                                "results": {
+                                    name: {
+                                        "fit_successful": name in passing,
+                                        "readout_fidelity": 0.9 if name in passing else 0.7,
+                                    }
+                                    for name in targets
+                                }
+                            }
+                        }
+                    ),
+                ),
+            )
+            service.record_decision(
+                workflow["id"], "offline-07b-thermal-pass", "repeat",
+                "Thermal run recorded.", None, None, None, "unittest",
+            )
+            plan = service.next_action(workflow["id"])
+            self.assertEqual(sorted(plan["run"]["qubits"]), passing)
+            service.request_run(
+                workflow["id"], "07b",
+                {"qubits": passing, "reset_type_thermal_or_active": "active"},
+                "Active-reset repeat for the passing pair.", "unittest",
             )
 
     def test_active_repeat_is_allowed_once_then_refused(self) -> None:

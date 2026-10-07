@@ -51,7 +51,8 @@ class Test02cAuthority(unittest.TestCase):
             )
             self.assertAlmostEqual(
                 values["/qubits/q1/resonator/operations/readout/amplitude"],
-                10.0 ** ((-30.0 - 5.0) / 20.0),
+                # 10 dB below the dressed boundary (operator rule 2026-10-02).
+                10.0 ** ((-30.0 - 10.0 - 5.0) / 20.0),
             )
             self.assertEqual(
                 values["/qubits/q1/extras/dressed_resonator_freq"],

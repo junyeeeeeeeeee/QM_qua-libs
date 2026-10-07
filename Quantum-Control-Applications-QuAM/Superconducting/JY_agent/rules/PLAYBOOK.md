@@ -56,7 +56,15 @@
 
 The default sequence is:
 
-`02x → 02c → 02a → 03a → 04 → 05 → 07b → 06 → 06b → 10a → 05st → 06st_t2star → 06st_t2e`
+`02 → 02x → 02c → 02a → 03a → 04 → 05 → 07d → 07b → 06 → 06b → 10a → 05st → 06st_t2star → 06st_t2e`
+
+`02`, `05st`, `06st_t2star` and `06st_t2e` are optional (operator request
+2026-10-04). The operator ticks them on the lease approval page; an unticked
+node is removed from that workflow's sequence and from the lease, so `advance`
+names the next ticked node and `jy_get_next_action` reports it. Do not request
+an unticked node and do not ask the operator to approve it separately. The same
+page sets the measurement mode from 03a on (see "A shared XY drive output runs
+one qubit at a time"); automatic measurement starts only after both choices.
 
 The operator places already-correct resonator frequencies in `state.json`
 before entry. Resonator spectroscopy (`02x`, `02c`, `02a`) only fine-tunes
@@ -165,11 +173,37 @@ and omit already-resolved targets. Split into separate multiplex subgroups only
 when those qubits scientifically cannot share the sweep (different frequency or
 power window, incompatible statistics wait time, or a 03a stage/LO constraint).
 A singleton retry is a last resort after a shared-parameter multiplex retry, not
-the default first action. Scheduling already-resolved targets again is a
+the default first action. None of this applies to a chip that shares an XY drive
+output: there the workflow is a qubit-by-qubit pass from 03a onward, and the
+section "A shared XY drive output runs one qubit at a time" replaces this one
+for every node in that tail. Scheduling already-resolved targets again is a
 recoverable planning error: the server rejects the request without hard-stopping
 an active autonomy lease.
 
 ## Node decisions
+
+### 02 — broadband resonator survey
+
+`02_Broadband_Spectroscopy.py` sweeps every readout line once over its LO
+±`max_if_in_mhz` (default ±400 MHz) at the 02x probe power, removes the
+electrical delay and the slow baseline, and lists resonator candidates. Run it
+once with every workflow target and the node defaults. It is single pass and
+advisory: whatever it finds, `advance` to 02x next.
+
+- Without `res_design_freq` (the default) it is a survey and proposes no state
+  change. Check its per-line candidate count against `num_expected` and report
+  a line with too few candidates, but 02x still runs.
+- With `res_design_freq` (only when the operator supplies one: q1..qn design
+  frequencies, length `res_num`), one global shift is fitted; only qubits whose
+  candidate lies within `design_match_tolerance_in_mhz` (10 MHz) of the shifted
+  design move `resonator/intermediate_frequency`. A `mismatch` or `not_found`
+  qubit fails and keeps its stored frequency.
+- Ticking 02 on the lease page requires the operator to enter `res_num` and
+  `res_design_freq` (GHz). They are stored on the workflow, shown as
+  `operator_parameters` by `jy_get_next_action`, and merged into every 02 run
+  automatically; do not pass different values.
+- The LO ±`lo_guard_in_mhz` region is excluded (LO leakage), and features
+  narrower than `min_linewidth_in_mhz` are spurs, not resonators.
 
 ### 02x — bare resonator spectroscopy
 
@@ -226,6 +260,38 @@ not pushed to the last point before punch-out. JY's deterministic analysis is
 authoritative for the proposed frequency and power; the protected node's
 derivative-threshold fit is advisory and must be ignored when it is empty or
 disagrees with the dressed boundary.
+
+Operator instruction, 2026-10-02: the committed readout power is that dressed
+boundary minus `analysis."02c".readout_power_backoff_db` (10 dB), so 07d and
+07b start well below the bare-resonator transition. Each readout line's
+`full_scale_power_dbm` (the MW-FEM port shared by its qubits) is then set to the
+smallest integer in [-11, 16] dBm for which every pulse amplitude stays at or
+below `max_readout_pulse_amplitude` (0.125, as in 07d) and the line's summed
+amplitude stays at or below `instrument_limits.multiplex.max_aggregate_readout_amplitude`
+(0.5). JY derives this; do not request it. The port changes only when every
+qubit on that line has a new 02c point: a subgroup retry, or a `needs_review`
+run where a line-mate failed, keeps the current full scale and expresses the
+passing qubits' powers as amplitudes at it.
+
+Operator rules, 2026-10-05:
+
+- **Window 2-5x the separation.** A target passes only when the frequency window
+  is between `min_window_to_separation_ratio` (2) and
+  `max_window_to_separation_ratio` (5) times its bare-dressed separation, so the
+  shift is visible in the plot. The first 02c is one multiplexed 16 MHz run
+  (the default) that finds each separation; a target outside the band fails
+  with the recommended span (3.5x) in its failure text and in
+  `recommended_frequency_span_mhz`. Before the narrow retry, call
+  `jy_request_02c_window_recenter` (with the lease id, then
+  `jy_autonomy_apply_setup_state`) to put each readout IF at the dressed/bare
+  midpoint, then retry with that span. Targets with similar recommended spans
+  share a run; others run separately. Pick the frequency step at about span/60.
+- **Shift the power window, keep 40 dB.** A smeared or unstable low-power dressed
+  plateau now blocks (`require_dressed_plateau_quality`), as does an obvious
+  power break. Rescan with `min_power_dbm`/`max_power_dbm` shifted together; the
+  policy requires `max - min = power_window_db` (40). Example: q7 on
+  2026-10-05 showed a noise band below -44 dBm read as the dressed plateau;
+  -42..-2 dBm excludes it.
 
 02c fails only when dressed and bare still cannot be told apart after the
 parameters have been driven to their policy limits — the frequency window up to
@@ -426,6 +492,50 @@ a target whose analysis passes still commits its state patch, because that is
 the node's output, and a target that does not pass simply carries no update and
 does not hold the workflow up.
 
+Operator instruction, 2026-09-29: 07d runs in groups of at most four qubits
+(`nodes."07d".max_multiplex_targets: 4`). The node's measurement batching in
+`quam_libs/experiments/readout_optimization_3d/measurement_batching.py` drops
+targets above four and then crashes with `KeyError`; four or fewer is a single
+batch. Single pass then means one run per group, every group on the defaults.
+07d stays out of `SUBGROUP_NODES`, so 07b still receives every target carried
+into 07d, not only those with passing 07d evidence.
+
+Operator choice, 2026-10-03: at 07b too, a target measured in the single pass
+but not passing (for example q1/q2 failing the two-blob test) does not block
+`advance` and stays active for 06/06b, which need no state discrimination. It
+keeps its 07d readout and gets no 07b threshold/angle/confusion update. Only a
+target explicitly marked scientifically unmeasurable at 07b is dropped.
+
+Operator instruction, 2026-10-02: with 02c committing the dressed limit minus
+10 dB, 07d sweeps the readout amplitude factor 0.2–3.16 (22 points), so its
+search reaches back up to the dressed limit. A run made on an older value of a
+`single_pass_default_keys` entry (here `max_amplitude_factor`) no longer counts
+toward single pass, which is how the first group measured on the old 1.99
+sweep earns one more run. The node's own power-setting step restores the
+pre-run amplitude, so JY commits amplitude = pre-run amplitude x the factor at
+the maximum of the node's smoothed `fidelity` map; an optimum at the top of the
+sweep is reported as a warning.
+
+Operator instruction, 2026-10-02 (later): 07d judges every swept point by how
+close its g/e shots are to two blobs, not by fidelity alone. A shot on the
+other blob (thermal population, decay) is a readout error that fidelity already
+counts; a shot beyond `analysis."07d".outlier_sigma` (3 sigma) of *both* blob
+centres is smear. The off-blob share is pooled over neighbouring frequency and
+amplitude points, and JY commits the highest-fidelity point whose pooled share
+is at most `max_outlier_fraction` (3%), rebuilding IF, amplitude and length from
+that point. Operator choice 2026-10-03: no point above the qubit's 02c
+dressed-limit power is ever chosen, and the two-blob point replaces the
+best-fidelity point only when it costs at most `fidelity_tolerance_percent`
+(2 points); otherwise the fidelity optimum is committed and 07b's two-blob test
+judges it. `num_runs` is 100 so each
+point has enough shots. 07b uses the same two-blob test on its 10000 shots
+(`analysis."07b".morphology_mode: "two_blob"`, at most 5% of a cloud on neither
+blob); the radius-quantile limits remain advisory notes. After a rule change,
+`jy_reopen_07d_after_readout_rule_change` returns the workflow from 07b or 06
+to 07d (lease stopped first). The reopen restarts the bring-up from 07d: runs
+of 07d and every later node (07b, 06, 06b, 10a, statistics) made before it no
+longer count, so 06 onward is re-measured with the reset groups below.
+
 This replaces the tail-power ladder below as the normal path for 07b. Keep the
 ladder documented: it is still the right tool if an operator deliberately
 reopens 07b, and it records what the morphology rule is protecting against.
@@ -448,6 +558,16 @@ thermal run never qualifies a qubit for active reset, whatever its fidelity.
 The statistics rule is unchanged: before any 05st or 06st run uses active
 reset, 05, 06 and 06b must be repeated and accepted with active reset for
 those qubits.
+
+### Reset groups after 07b
+
+Operator choice, 2026-10-04 (`reset_policy.group_by_reset_after_qualification`).
+At every node after 07b that has a reset parameter (06, 06b, 10a, statistics),
+the active targets split into two groups: the qubits qualified by an accepted
+active-reset 07b run use active reset, the rest thermal. Each group gets its own
+shared first batch, the two never share a run, and `jy_get_next_action`
+proposes the active group first with the reset parameter filled in. After a
+07d reopen only the new 07b runs qualify.
 
 ### 07b — IQ blobs
 
@@ -509,6 +629,18 @@ baselines.
 
 ### 06 / 06b — Ramsey T2* and echo T2
 
+Operator instruction, 2026-10-02: the Ramsey detuning is inversely
+proportional to the window, `frequency_detuning_in_mhz x max_wait_time_in_ns/1000
+~= 4` (1 us -> 4 MHz, 10 us -> 0.4 MHz, 40 us -> 0.1 MHz), so every 06 plot shows
+about four fringes and can be read by eye. Choose the window from T2* (at least
+3.5 lifetimes) and omit `frequency_detuning_in_mhz`: the policy derives it. An
+explicit detuning more than 25% off the rule
+(`nodes."06".detuning_wait_product_*`) is refused before the hardware. Use a
+linear sweep with enough points to resolve the fringe (the defaults are 40 us,
+0.1 MHz, 400 linear points). `06_Ramsey.py` measures one qubit per batch, so the
+run time grows with qubits x points x averages; keep the window no longer than
+needed.
+
 Run Ramsey followed by T2 echo. Require a finite positive lifetime, relative
 uncertainty below 0.25, at least two samples per lifetime, and at least 3.5
 lifetimes of coverage before resolving a qubit. T2 echo additionally requires
@@ -519,6 +651,11 @@ retry unresolved qubits together when they can share that window. Use the
 emitted 4.5x recommended statistics wait time when forming compatible target
 subgroups. The Ramsey frequency correction and T2 state values remain separately
 committed.
+
+A node fit that fails records NaN (the 06b node's `fit_decay_exp` assumes a
+falling trace and fails on a rising, inverted-contrast I quadrature). JY stores
+it as null; its own sign-agnostic decay fit then supplies the value, and if
+that fit also fails only that qubit is refused, not the whole run.
 
 ### 10a — single-qubit randomized benchmarking
 
@@ -670,6 +807,86 @@ situation, that is the honest answer: read the node's section above and
 `jy_get_decision_experience` for what was tried before; each entry carries an
 `evidence` digest of the gated numbers, and `include_analysis=True` only when
 the digest is genuinely not enough.
+
+## A shared XY drive output runs one qubit at a time
+
+Operator instruction, 2026-09-22. Read `wiring.json` before planning anything.
+If any two qubits name the same `wiring.qubits.<q>.xy.opx_output`, those qubits
+share one physical drive line and therefore one LO. Such a chip cannot be swept
+node by node across all of its targets, because placing one qubit at zero IF
+moves every other qubit on the port.
+
+On such a chip the workflow changes shape:
+
+- 02, 02x, 02c and 02a are unchanged. They only use the readout line, so they still
+  multiplex every active target and the multiplex section above applies to them
+  in full.
+- From 03a the workflow takes ONE qubit through the whole remaining sequence --
+  03a, 04, 05, 07d, 07b, 06, 06b, 10a and the statistics nodes -- and only then
+  returns to 03a for the next qubit. A pass ends either at the end of the
+  sequence or as soon as its qubit stops being measurable.
+- The LO therefore only ever moves between passes, never inside one. That is
+  what makes the shared line workable: when a new pass starts at 03a, its qubit
+  goes to zero IF and the shared LO is free to move to that qubit's RF.
+- Every other qubit on that port has its `xy/intermediate_frequency` rewritten
+  in the same patch so its RF is preserved. The server does this automatically
+  in `jy_request_initial_03a_zero_if`, `jy_request_drive_lo_recenter`,
+  `jy_request_03a_window_shift` and `jy_request_03a_candidate_center`; it
+  refuses the move if any of those compensated IFs would exceed the IF limit.
+
+The rule lives in `rules/policies.yaml` under `shared_xy_drive`
+(`serialize_from_node: "03a"`, `per_qubit_pass: true`,
+`max_multiplex_targets: 1`). It is derived from the wiring, not from the chip
+name, so it switches itself on and off when the active QuAM state changes.
+
+Operator request 2026-10-04: the lease approval page shows what the wiring
+implies and asks the operator to choose `per_qubit` (this per-qubit pass) or
+`multiplex` (the ordinary node-by-node sweep) before automatic measurement
+starts. The choice overrides the wiring default for the whole workflow:
+`per_qubit` serializes even a chip with one XY output per qubit, and
+`multiplex` lifts the one-qubit cap on a shared-output chip (the shared LO is
+then never moved for an individual qubit). The workflow keeps its mode; a later
+lease only confirms it.
+
+Driving the pass:
+
+- `jy_get_next_action` carries a `serial_pass` block: which qubit the pass is
+  on, its position in the order, which qubits are finished and which are still
+  waiting. The node's active target set is that one qubit; the others are not
+  eligible here until their own pass starts.
+- A run proposal naming more than one qubit at a tail node is refused before the
+  worker reaches hardware. That is a correctable planning error, not a halt.
+- `advance` keeps its usual meaning while the qubit still has usable evidence:
+  the next node in the sequence, same qubit.
+- When the qubit's pass is over -- the last node is done, or the qubit is
+  resolved nowhere further -- `advance` names 03a again, and the next qubit
+  starts there. On the last qubit it names nothing and the workflow completes.
+  The server tells you which of these it expects; a wrong `next_node` is
+  refused with the reason.
+- A qubit that cannot be measured ends its pass rather than the workflow. Mark
+  it with `jy_mark_scientifically_unmeasurable` and then record the `advance`
+  that returns to 03a. That mark may be taken either after a `manual_review`
+  decision or directly against the unreviewed evidence run, because a run holds
+  exactly one decision and a single-qubit pass has no other run to carry the
+  advance.
+
+## The 03a drive LO stays inside its band
+
+Operator instruction, 2026-09-22. Every MW upconverter frequency has to stay at
+least `instrument_limits.mw_band_edge_margin_hz` (100 MHz) inside the frequency
+range of the band its port is configured for, so that an LO placed near an edge
+never turns into a hardware error. The band ranges are in
+`instrument_limits.mw_band_frequency_hz`; with the default margin band 1 gives
+an LO window of 0.15-5.4 GHz, band 2 gives 4.6-7.4 GHz and band 3 gives
+6.6-10.4 GHz.
+
+A state commit that puts an upconverter frequency outside its band window is
+refused. An RF-preserving recenter that would need such an LO is refused too,
+because moving the LO anyway would falsify the qubit's frequency. The one
+exception is an explicit 03a coarse-window shift, which is clamped to the edge
+of the window instead: the search keeps stepping along the band rather than
+stalling, and the applied centre is reported in the setup details as
+`clamped_to_band`.
 
 ## 04 never multiplexes more than five targets
 

@@ -6,13 +6,18 @@ import re
 from pathlib import Path
 from typing import Any
 
+from .analysis_07d import cloud_outlier_fractions, two_blob_metrics
 from .analysis_02c import (
     analyze_02c_transitions,
     node_selected_readout_powers_dbm,
 )
 from .config import Settings
 from .policy import PolicyEngine
-from .state_patch_02c import derive_02c_state_patch
+from .state_patch_02c import (
+    _readout_line,
+    derive_02c_state_patch,
+    reconcile_02c_full_scale,
+)
 from .state import (
     filter_patch,
     json_diff,
@@ -20,6 +25,7 @@ from .state import (
     patch_qubit_targets,
     pointer_get,
     recorded_updates_to_patch,
+    StateError,
     snapshot_state_path,
     split_patch_by_target,
 )
@@ -318,6 +324,7 @@ class SnapshotAnalyzer:
                         current,
                         dataset_metrics,
                         targets,
+                        self.policy.raw,
                     )
                     failures.extend(jy_patch_errors)
                     warnings.append(
@@ -351,6 +358,22 @@ class SnapshotAnalyzer:
                         )
                     )
                     warnings.extend(normalization_warnings)
+                elif node_id == "07d":
+                    candidate_patch, normalization_warnings, selection_failures = (
+                        _select_07d_readout_patch(
+                            candidate_patch,
+                            snapshot,
+                            current,
+                            targets,
+                            self.policy.raw.get("analysis", {}).get("07d", {}),
+                            (run or {}).get("readout_power_limits_dbm"),
+                            load_state(self.settings.wiring_path)
+                            if self.settings.wiring_path.is_file()
+                            else {},
+                        )
+                    )
+                    warnings.extend(normalization_warnings)
+                    failures.extend(selection_failures)
                 elif node_id == "07b":
                     candidate_patch, normalization_warnings = (
                         self._normalize_07b_fidelity_patch(
@@ -358,13 +381,15 @@ class SnapshotAnalyzer:
                         )
                     )
                     warnings.extend(normalization_warnings)
+                candidate_patch, missing_value_failures = _drop_missing_values(
+                    candidate_patch, current
+                )
+                failures.extend(missing_value_failures)
                 if candidate_patch:
-                    try:
-                        self.policy.validate_state_patch(candidate_patch, current)
-                    except Exception as exc:
-                        failures.append(
-                            f"Candidate state update violates policy: {exc}"
-                        )
+                    candidate_patch, policy_failures = _validate_patch_per_target(
+                        self.policy, candidate_patch, current
+                    )
+                    failures.extend(policy_failures)
                 if rejected_patch:
                     warnings.append(
                         f"{len(rejected_patch)} snapshot/recorded changes are outside this "
@@ -396,6 +421,20 @@ class SnapshotAnalyzer:
             candidate_patch, dropped = split_patch_by_target(
                 candidate_patch, set(passing_targets)
             )
+            if node_id == "02c":
+                candidate_patch, reconcile_warnings = reconcile_02c_full_scale(
+                    self.settings,
+                    current,
+                    candidate_patch,
+                    dropped,
+                    set(passing_targets),
+                    self.policy.raw,
+                )
+                warnings.extend(reconcile_warnings)
+                kept_paths = {item["path"] for item in candidate_patch}
+                dropped = [
+                    item for item in dropped if item["path"] not in kept_paths
+                ]
             suppressed_targets = sorted(
                 patch_qubit_targets(dropped) - set(passing_targets)
             )
@@ -835,6 +874,11 @@ class SnapshotAnalyzer:
             else re.compile(r"a^")
         )
         node_patterns = {
+            # 02 moves the readout IF only for qubits matched to the shifted
+            # design within tolerance; the node itself withholds the rest.
+            "02": [
+                r"^/qubits/q[0-9]+/resonator/intermediate_frequency$",
+            ],
             "02x": [
                 r"^/qubits/q[0-9]+/resonator/intermediate_frequency$",
                 r"^/qubits/q[0-9]+/extras/bare_resonator_freq$",
@@ -1001,10 +1045,16 @@ class SnapshotAnalyzer:
                     transition["protected_node_power_disagreement_db"] = (
                         float(node_power) - float(power)
                     )
+                backoff = float(
+                    self.policy.raw.get("analysis", {})
+                    .get("02c", {})
+                    .get("readout_power_backoff_db", 0.0)
+                )
                 jy_results[name] = {
                     "source": "jy_dressed_plateau_boundary",
                     "RO_frequency": float(frequency),
-                    "readout_power_dbm": float(power),
+                    "dressed_power_limit_dbm": float(power),
+                    "readout_power_dbm": float(power) - backoff,
                 }
             normalized = _json_safe(jy_results)
 
@@ -1394,6 +1444,9 @@ class SnapshotAnalyzer:
         max_p95 = float(rules["max_p95_to_median_radius"])
         max_p99 = float(rules["max_p99_to_median_radius"])
         min_samples = int(rules["min_cloud_samples"])
+        two_blob = str(rules.get("morphology_mode", "radius")) == "two_blob"
+        blob_sigma = float(rules.get("two_blob_outlier_sigma", 3.0))
+        blob_max = float(rules.get("two_blob_max_outlier_fraction", 0.05))
         qubit_names = (
             [str(item) for item in dataset.coords["qubit"].values]
             if "qubit" in dataset.coords
@@ -1403,6 +1456,7 @@ class SnapshotAnalyzer:
         for name in qubit_names:
             clouds: dict[str, Any] = {}
             failures: list[str] = []
+            shots: dict[str, Any] = {}
             for label in ("g", "e"):
                 i_name, q_name = f"I_{label}", f"Q_{label}"
                 if i_name not in dataset.data_vars or q_name not in dataset.data_vars:
@@ -1421,6 +1475,7 @@ class SnapshotAnalyzer:
                         f"{label}-cloud has {points.shape[0]} samples; requires {min_samples}"
                     )
                     continue
+                shots[label] = points[:, 0] + 1j * points[:, 1]
                 center = np.median(points, axis=0)
                 centered = points - center
                 radius = np.linalg.norm(centered, axis=1)
@@ -1459,18 +1514,42 @@ class SnapshotAnalyzer:
                 failures.extend(
                     f"{label}-cloud {reason}" for reason in cloud_failures
                 )
-            metrics[name] = {
-                "morphology_pass": not failures and len(clouds) == 2,
-                "morphology_failures": failures,
-                "clouds": clouds,
-            }
+            entry: dict[str, Any] = {"clouds": clouds}
+            if two_blob and len(clouds) == 2:
+                # Operator instruction 2026-10-02: judge the clouds as two
+                # blobs. Shots on the other blob are readout errors (counted
+                # by fidelity); only shots on neither blob fail a cloud. The
+                # radius quantiles above stay as advisory notes.
+                entry["radius_rule_notes"] = failures
+                failures = []
+                try:
+                    blob = cloud_outlier_fractions(
+                        shots["g"], shots["e"], blob_sigma
+                    )
+                except ValueError as exc:
+                    failures.append(f"two-blob test failed: {exc}")
+                else:
+                    entry["two_blob"] = blob
+                    for label in ("g", "e"):
+                        share = blob[f"{label}_on_neither_blob"]
+                        if share > blob_max:
+                            failures.append(
+                                f"{label}-cloud has {share:.1%} of shots on neither "
+                                f"blob (> {blob_max:.0%} beyond {blob_sigma:g} sigma)"
+                            )
+            entry["morphology_pass"] = not failures and len(clouds) == 2
+            entry["morphology_failures"] = failures
+            metrics[name] = entry
         return {
             "qubits": metrics,
             "morphology_rule": {
+                "mode": "two_blob" if two_blob else "radius",
                 "max_cloud_axis_ratio": max_axis,
                 "max_p95_to_median_radius": max_p95,
                 "max_p99_to_median_radius": max_p99,
                 "min_cloud_samples": min_samples,
+                "two_blob_outlier_sigma": blob_sigma,
+                "two_blob_max_outlier_fraction": blob_max,
             },
         }
 
@@ -1501,6 +1580,8 @@ class SnapshotAnalyzer:
     ) -> dict[str, Any]:
         if node_id in {"05st", "06st_t2star", "06st_t2e"}:
             return self._statistics_metadata(node_id, data)
+        if node_id == "02":
+            return _broadband_metadata(data)
         dataset_path = snapshot / "ds.h5"
         if not dataset_path.is_file():
             return {"error": "Snapshot has no ds.h5 dataset.", "qubits": {}}
@@ -1916,6 +1997,35 @@ def _decay_metric_rank(metrics: dict[str, Any]) -> tuple[int, int, float, float]
         if _finite(metrics.get("robust_snr"))
         else float("-inf"),
     )
+
+
+def _broadband_metadata(data: dict[str, Any] | None) -> dict[str, Any]:
+    """Summarise a 02 broadband run per readout line and per design qubit.
+
+    The dataset is indexed by readout line, not by qubit, so the generic sweep
+    metrics do not apply. The node's own outcomes carry the per-qubit verdict.
+    """
+
+    fit = data.get("fit_results") if isinstance(data, dict) else None
+    if not isinstance(fit, dict) or not isinstance(fit.get("lines"), dict):
+        return {"error": "02 has no per-line fit_results.", "qubits": {}}
+    lines = {
+        str(line): {
+            "LO": result.get("LO"),
+            "electrical_delay_ns": result.get("electrical_delay_ns"),
+            "num_candidates": result.get("num_candidates"),
+            "num_expected": result.get("num_expected"),
+            "selected_freqs": result.get("selected_freqs"),
+        }
+        for line, result in fit["lines"].items()
+        if isinstance(result, dict)
+    }
+    assignments = fit.get("assignments")
+    return {
+        "lines": lines,
+        "design_shift_hz": fit.get("design_shift"),
+        "qubits": assignments if isinstance(assignments, dict) else {},
+    }
 
 
 def _recommended_statistics_wait_ns(lifetime_seconds: float) -> int:
@@ -2348,6 +2458,246 @@ def _reset_type(parameters: Any) -> str:
         parameters.get("reset_type_thermal_or_active", "thermal"),
     )
     return str(value).strip().casefold()
+
+
+def _select_07d_readout_patch(
+    patch: list[dict[str, Any]],
+    snapshot: Path,
+    current: dict[str, Any],
+    targets: list[str],
+    rules: dict[str, Any],
+    power_limits_dbm: dict[str, float] | None = None,
+    wiring: dict[str, Any] | None = None,
+) -> tuple[list[dict[str, Any]], list[str], list[str]]:
+    """Choose each 07d readout point from fidelity and two-blob shape.
+
+    Operator instruction 2026-10-02. The committed point is the highest
+    smoothed fidelity among points whose IQ shots, pooled over neighbouring
+    frequency/amplitude points, lie on one of the two blobs. IF, amplitude and
+    length are rebuilt from that point; the node's own choice is replaced.
+    Without per-shot data, only the amplitude is recovered from the node's
+    fidelity optimum.
+    """
+    try:
+        dataset = _load_xarray_dataset(snapshot / "ds.h5")
+    except Exception:
+        return patch, [], []
+    if not all(name in dataset.data_vars for name in ("I_g", "Q_g", "I_e", "Q_e", "fidelity")):
+        normalized, warnings = _normalize_07d_amplitude_patch(patch, snapshot, current)
+        return normalized, warnings, []
+    warnings: list[str] = []
+    failures: list[str] = []
+    max_factors: dict[str, float] = {}
+    for name in targets:
+        limit = (power_limits_dbm or {}).get(name)
+        if not _finite(limit):
+            continue
+        try:
+            full_scale = float(_readout_line(current, wiring or {}, name)["full_scale"])
+            before = float(
+                pointer_get(
+                    current, f"/qubits/{name}/resonator/operations/readout/amplitude"
+                )
+            )
+            max_factors[name] = 10.0 ** ((float(limit) - full_scale) / 20.0) / before
+        except Exception:
+            continue
+    missing_cap = sorted(set(targets) - set(max_factors))
+    if missing_cap and power_limits_dbm is not None:
+        warnings.append(
+            f"07d has no 02c dressed-limit power for {missing_cap}; their "
+            "amplitude is not capped."
+        )
+    selection = two_blob_metrics(dataset, rules, max_factors)
+    by_path = {item["path"]: dict(item) for item in patch}
+    for name in targets:
+        entry = selection.get(name)
+        if entry is None:
+            continue
+        chosen = entry.get("selected")
+        if chosen is None:
+            reason = entry.get("reason", "no usable point")
+            failures.append(f"{name} 07d: {reason}.")
+            continue
+        unconstrained = entry["unconstrained"]
+        base = f"/qubits/{name}/resonator"
+        try:
+            old_if = float(pointer_get(current, f"{base}/intermediate_frequency"))
+            old_amp = float(pointer_get(current, f"{base}/operations/readout/amplitude"))
+        except Exception:
+            failures.append(f"{name} 07d pre-run readout IF/amplitude is unavailable.")
+            continue
+        values = {
+            f"{base}/intermediate_frequency": int(round(old_if + chosen["frequency_offset_hz"])),
+            f"{base}/operations/readout/amplitude": old_amp * chosen["amplitude_factor"],
+            f"{base}/operations/readout/length": int(chosen["duration_ns"]),
+        }
+        for path, value in values.items():
+            by_path[path] = {"op": "replace", "path": path, "value": value}
+        moved = any(
+            chosen[key] != unconstrained[key]
+            for key in ("frequency_offset_hz", "amplitude_factor", "duration_ns")
+        )
+        cap = entry.get("max_amplitude_factor")
+        kind = "two-blob point" if entry.get("two_blob") else "fidelity optimum"
+        text = (
+            f"{name} 07d {kind}: {chosen['fidelity_percent']:.1f}% at "
+            f"{chosen['frequency_offset_hz'] / 1e6:+.2f} MHz, factor "
+            f"{chosen['amplitude_factor']:.3g}"
+            + (f" (cap {cap:.3g} = 02c dressed limit)" if cap is not None else "")
+            + f", {chosen['duration_ns']} ns, off-blob {chosen['outlier_fraction']:.1%}"
+        )
+        cost = entry.get("two_blob_fidelity_cost_percent")
+        if moved:
+            text += (
+                f"; fidelity optimum {unconstrained['fidelity_percent']:.1f}% had "
+                f"off-blob {unconstrained['outlier_fraction']:.1%}."
+            )
+        elif not entry.get("two_blob") and cost is not None:
+            text += (
+                f"; a two-blob point would cost {cost:.1f} fidelity points (> "
+                f"{entry['fidelity_tolerance_percent']:g}), so 07b judges this one."
+            )
+        elif not entry.get("two_blob"):
+            text += "; no capped point is a clean two-blob point, so 07b judges this one."
+        warnings.append(text)
+        if chosen.get("at_amplitude_top"):
+            warnings.append(
+                f"{name} 07d point sits at the top of the allowed amplitude range."
+            )
+    return list(by_path.values()), warnings, failures
+
+
+def _normalize_07d_amplitude_patch(
+    patch: list[dict[str, Any]], snapshot: Path, current: dict[str, Any]
+) -> tuple[list[dict[str, Any]], list[str]]:
+    """Commit 07d's measured optimal readout amplitude.
+
+    The node multiplies the readout amplitude by the optimal factor and then
+    calls ``set_output_power``, which restores the pre-run amplitude, so the
+    recorded update loses the optimum (lesson 2026-09-30). The node's smoothed
+    ``fidelity(qubit, freq, amp, duration)`` map still holds it: the committed
+    amplitude is the pre-run amplitude times the factor at the fidelity
+    maximum. The node itself is unchanged.
+    """
+    try:
+        dataset = _load_xarray_dataset(snapshot / "ds.h5")
+        fidelity = dataset["fidelity"]
+    except Exception:
+        return patch, []
+    pattern = re.compile(r"^/qubits/(q[0-9]+)/resonator/operations/readout/amplitude$")
+    amp_values = [float(value) for value in fidelity["amp"].values]
+    top = max(amp_values)
+    normalized: list[dict[str, Any]] = []
+    warnings: list[str] = []
+    for raw_item in patch:
+        item = dict(raw_item)
+        match = pattern.fullmatch(str(item.get("path", "")))
+        if match is None:
+            normalized.append(item)
+            continue
+        name = match.group(1)
+        try:
+            before = float(pointer_get(current, item["path"]))
+            trace = fidelity.sel(qubit=name)
+            index = trace.argmax(dim=list(trace.dims))
+            factor = float(trace["amp"].values[int(index["amp"])])
+        except Exception:
+            normalized.append(item)
+            continue
+        if not (_finite(before) and _finite(factor) and factor > 0):
+            normalized.append(item)
+            continue
+        item["value"] = before * factor
+        warnings.append(
+            f"{name} 07d readout amplitude = pre-run {before:.4g} x optimal "
+            f"factor {factor:.3g} = {item['value']:.4g}."
+        )
+        if factor >= top:
+            warnings.append(
+                f"{name} 07d optimum sits at the top of the amplitude sweep "
+                f"(factor {factor:.3g}); the best power may lie higher."
+            )
+        normalized.append(item)
+    return normalized, warnings
+
+
+def _validate_patch_per_target(
+    policy: Any, patch: list[dict[str, Any]], current: dict[str, Any]
+) -> tuple[list[dict[str, Any]], list[str]]:
+    """Validate a candidate patch so one qubit's bad value fails only that qubit.
+
+    2026-10-04: a negative T2ramsey fitted for q10 made the whole 06 patch
+    violate policy, and the run-level failure suppressed every target. The
+    whole patch is tried first; on failure each qubit's entries are checked
+    alone, failing qubits are dropped with a per-target reason, and entries
+    that name no qubit stay a run-level failure.
+    """
+    try:
+        policy.validate_state_patch(patch, current)
+        return patch, []
+    except Exception:
+        pass
+    groups: dict[str | None, list[dict[str, Any]]] = {}
+    for item in patch:
+        match = re.match(r"^/qubits/(q[0-9]+)/", str(item.get("path", "")))
+        groups.setdefault(match.group(1) if match else None, []).append(item)
+    kept: list[dict[str, Any]] = []
+    failures: list[str] = []
+    for name, items in groups.items():
+        try:
+            policy.validate_state_patch(items, current)
+        except Exception as exc:
+            if name is None:
+                failures.append(f"Candidate state update violates policy: {exc}")
+            else:
+                failures.append(f"{name} state update violates policy: {exc}")
+            continue
+        kept.extend(items)
+    if not failures and kept:
+        # Each group is valid alone but not together (e.g. a shared port);
+        # keep the run-level refusal for that case.
+        try:
+            policy.validate_state_patch(kept, current)
+        except Exception as exc:
+            return kept, [f"Candidate state update violates policy: {exc}"]
+    return kept, failures
+
+
+def _drop_missing_values(
+    patch: list[dict[str, Any]], current: dict[str, Any]
+) -> tuple[list[dict[str, Any]], list[str]]:
+    """Remove updates whose value a failed fit left empty.
+
+    The worker stores a node's NaN as ``None`` (06b's ``fit_decay_exp`` on a
+    rising trace). When no JY normalization replaced it, the update is dropped
+    and that one qubit fails, instead of the whole patch violating policy and
+    blocking every target. A ``None`` that only restates the current ``None``
+    is kept.
+    """
+
+    kept: list[dict[str, Any]] = []
+    failures: list[str] = []
+    for item in patch:
+        value = item.get("value")
+        path = str(item.get("path", ""))
+        missing = isinstance(value, float) and not math.isfinite(value)
+        if value is None:
+            try:
+                missing = pointer_get(current, path) is not None
+            except (KeyError, IndexError, StateError):
+                missing = True
+        if not missing:
+            kept.append(item)
+            continue
+        match = re.match(r"^/qubits/(q[0-9]+)/", path)
+        if match:
+            failures.append(
+                f"{match.group(1)} node fit produced no finite value for {path}"
+            )
+        else:
+            failures.append(f"Node fit produced no finite value for {path}")
+    return kept, failures
 
 
 def _finite(value: Any) -> bool:

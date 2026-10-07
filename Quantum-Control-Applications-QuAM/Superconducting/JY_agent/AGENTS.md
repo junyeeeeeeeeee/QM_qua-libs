@@ -34,7 +34,10 @@ operator explicitly overrides them; a new workflow uses `state.json`
 `active_qubit_names` and defaults `multiplexed=true`. `進入 JY 自動量測模式` calls
 `jy_enter_autonomy_mode`, shows its session `browser_url`, waits for the one
 bounded-lease activation with `jy_wait_for_autonomy_status`, and then uses only
-`jy_autonomy_*` execution tools. On hosts with durable goals, automatic-mode
+`jy_autonomy_*` execution tools. On that approval page the operator also ticks
+the optional nodes (`02`, `05st`, `06st_t2star`, `06st_t2e`) and chooses
+one-qubit-at-a-time or multiplexed measurement from 03a on; tell them so with
+the link, and follow `jy_get_next_action`, which already skips unticked nodes. On hosts with durable goals, automatic-mode
 entry creates one session goal and keeps waiting/advancing until completion,
 operator stop, lease expiry, or hard stop. On other hosts, keep the current turn
 alive while possible but do not promise indefinite model lifetime; `已核准` is

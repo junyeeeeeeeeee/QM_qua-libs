@@ -13,6 +13,7 @@ from .state import (
     operation_amplitude,
     operation_backing_name,
     pointer_get,
+    shared_xy_drive_groups,
 )
 from .util import is_finite_number
 
@@ -27,6 +28,7 @@ class PolicyEngine:
         self.raw = load_policies(settings)
         self.nodes: dict[str, dict[str, Any]] = self.raw["nodes"]
         self.limits: dict[str, Any] = self.raw["instrument_limits"]
+        self.shared_xy_drive: dict[str, Any] = self.raw.get("shared_xy_drive", {})
 
     def node_definition(self, node_id: str) -> dict[str, Any]:
         try:
@@ -56,7 +58,11 @@ class PolicyEngine:
         return script
 
     def validate_run(
-        self, node_id: str, parameters: dict[str, Any]
+        self,
+        node_id: str,
+        parameters: dict[str, Any],
+        *,
+        drive_mode: str | None = None,
     ) -> tuple[dict[str, Any], list[str]]:
         if not isinstance(parameters, dict):
             raise PolicyError("parameters must be an object")
@@ -67,6 +73,19 @@ class PolicyEngine:
             raise PolicyError(f"Unsupported parameters for {node_id}: {unknown}")
 
         merged = {**definition.get("defaults", {}), **parameters}
+        product = definition.get("detuning_wait_product_mhz_us")
+        if (
+            product is not None
+            and "frequency_detuning_in_mhz" not in parameters
+            and is_finite_number(merged.get("max_wait_time_in_ns"))
+            and float(merged["max_wait_time_in_ns"]) > 0
+        ):
+            # Operator instruction 2026-10-02: the Ramsey detuning follows the
+            # window, so a run that does not name one gets the matching value.
+            merged["frequency_detuning_in_mhz"] = round(
+                float(product) / (float(merged["max_wait_time_in_ns"]) / 1000.0),
+                6,
+            )
         if self.settings.require_explicit_qubits and "qubits" not in parameters:
             raise PolicyError("An explicit qubits list is required for every run")
         for key, value in merged.items():
@@ -84,6 +103,7 @@ class PolicyEngine:
             raise PolicyError("qubits must not contain duplicates")
 
         self._validate_common_sweep(merged)
+        self._validate_detuning_wait_product(definition, merged)
         self._validate_node_specific(node_id, merged, state)
         warnings: list[str] = []
         if definition["flux_behavior"] == "hardcoded_min":
@@ -93,9 +113,105 @@ class PolicyEngine:
             )
         else:
             warnings.append(f"{node_id} is constrained to joint flux mode.")
+        self._validate_shared_xy_drive_targets(node_id, qubits, drive_mode)
         if merged.get("multiplexed") is True and len(qubits) > 1:
             warnings.extend(self.validate_multiplex_targets(qubits, state))
         return merged, warnings
+
+    def _validate_shared_xy_drive_targets(
+        self, node_id: str, qubits: list[str], drive_mode: str | None = None
+    ) -> None:
+        """Hold a shared-drive node to one qubit per run."""
+
+        cap = self.shared_xy_drive_cap(node_id, drive_mode)
+        if cap is None or len(qubits) <= cap:
+            return
+        groups = self.shared_xy_drive_groups()
+        shared = "; ".join(
+            f"{output} drives {', '.join(names)}"
+            for output, names in sorted(groups.items())
+        ) or "the operator chose per-qubit measurement"
+        raise PolicyError(
+            f"{node_id} may measure at most {cap} qubit(s) per run because this "
+            f"chip shares XY drive outputs ({shared}); requested {len(qubits)}. "
+            "Run the unresolved qubits one at a time and finish the node before "
+            "advancing."
+        )
+
+    def mw_band_lo_window(self, band: Any) -> tuple[float, float] | None:
+        """The LO range this MW band allows, keeping clear of its edges.
+
+        Operator instruction 2026-09-22: an LO within
+        `mw_band_edge_margin_hz` of a band edge risks a hardware error, so the
+        usable window is the band range shrunk by that margin at both ends.
+        `None` means the band is unknown and only the global limits apply.
+        """
+
+        bands = self.limits.get("mw_band_frequency_hz")
+        if not isinstance(bands, dict) or isinstance(band, bool):
+            return None
+        if not isinstance(band, int):
+            return None
+        span = bands.get(band, bands.get(str(band)))
+        if not isinstance(span, dict):
+            return None
+        low, high = span.get("min"), span.get("max")
+        if not is_finite_number(low) or not is_finite_number(high):
+            return None
+        margin = self.limits.get("mw_band_edge_margin_hz", 0)
+        if not is_finite_number(margin):
+            margin = 0
+        low, high = float(low) + float(margin), float(high) - float(margin)
+        return (low, high) if low <= high else None
+
+    def shared_xy_drive_groups(self) -> dict[str, list[str]]:
+        """XY drive outputs that more than one qubit of this chip shares."""
+
+        try:
+            wiring = load_state(self.settings.wiring_path)
+        except Exception:  # pragma: no cover - a missing wiring file is reported elsewhere
+            return {}
+        return shared_xy_drive_groups(wiring)
+
+    def serializes_on_shared_xy_drive(self, node_id: str) -> bool:
+        """True when this node uses the drive line the chip shares.
+
+        Nodes before `shared_xy_drive.serialize_from_node` only touch the
+        readout line, so a shared drive output does not constrain them.
+        """
+
+        first = self.shared_xy_drive.get("serialize_from_node")
+        if not isinstance(first, str):
+            return False
+        sequence = list(self.settings.workflow_sequence)
+        if first not in sequence or node_id not in sequence:
+            return False
+        return sequence.index(node_id) >= sequence.index(first)
+
+    def shared_xy_drive_cap(
+        self, node_id: str, drive_mode: str | None = None
+    ) -> int | None:
+        """Targets per run this node allows on a shared XY drive output.
+
+        `None` means the shared-drive rule does not apply: either the chip
+        wires every qubit to its own XY output, or the node runs before the
+        drive line is used.
+
+        Operator request 2026-10-04: `drive_mode`, chosen on the lease
+        approval page, overrides the wiring -- `per_qubit` applies the cap on
+        any chip and `multiplex` lifts it. `None` keeps the wiring default.
+        """
+
+        cap = self.shared_xy_drive.get("max_multiplex_targets")
+        if isinstance(cap, bool) or not isinstance(cap, int) or cap <= 0:
+            return None
+        if not self.serializes_on_shared_xy_drive(node_id):
+            return None
+        if drive_mode == "multiplex":
+            return None
+        if drive_mode == "per_qubit":
+            return cap
+        return cap if self.shared_xy_drive_groups() else None
 
     def validate_multiplex_targets(
         self,
@@ -210,6 +326,12 @@ class PolicyEngine:
             valid = is_finite_number(value)
         elif rule == "optional_number":
             valid = value is None or is_finite_number(value)
+        elif rule == "optional_positive_number_list":
+            valid = value is None or (
+                isinstance(value, list)
+                and bool(value)
+                and all(is_finite_number(item) and float(item) > 0 for item in value)
+            )
         elif rule == "positive_number":
             valid = is_finite_number(value) and float(value) > 0
         elif rule == "nonnegative_number":
@@ -237,6 +359,37 @@ class PolicyEngine:
         if not valid:
             raise PolicyError(f"Parameter {key!r} violates rule {rule!r}: {value!r}")
 
+    def _validate_detuning_wait_product(
+        self, definition: dict[str, Any], parameters: dict[str, Any]
+    ) -> None:
+        """Keep the Ramsey detuning inversely proportional to its window.
+
+        Operator instruction 2026-10-02: detuning [MHz] x max wait [us] stays
+        near a fixed product (4 MHz*us: 1 us -> 4 MHz, 10 us -> 0.4 MHz), so
+        every Ramsey plot shows about the same number of fringes and is easy
+        to read by eye.
+        """
+
+        product = definition.get("detuning_wait_product_mhz_us")
+        if product is None:
+            return
+        tolerance = float(definition.get("detuning_wait_product_tolerance", 0.25))
+        detuning = parameters.get("frequency_detuning_in_mhz")
+        wait_ns = parameters.get("max_wait_time_in_ns")
+        if not is_finite_number(detuning) or not is_finite_number(wait_ns):
+            return
+        window_us = float(wait_ns) / 1000.0
+        actual = float(detuning) * window_us
+        if abs(actual - float(product)) > tolerance * float(product):
+            expected = float(product) / window_us
+            raise PolicyError(
+                f"frequency_detuning_in_mhz {float(detuning):g} with a "
+                f"{window_us:g} us window gives {actual:g} MHz*us; the Ramsey "
+                f"rule needs about {float(product):g} MHz*us, i.e. "
+                f"{expected:.4g} MHz for this window (or omit the detuning and "
+                "it is derived)"
+            )
+
     def _validate_common_sweep(self, parameters: dict[str, Any]) -> None:
         averages = parameters.get("num_averages")
         if averages is not None and averages > int(self.limits["max_num_averages"]):
@@ -257,6 +410,32 @@ class PolicyEngine:
         self, node_id: str, parameters: dict[str, Any], state: dict[str, Any]
     ) -> None:
         qubits = parameters["qubits"]
+        if node_id == "02":
+            # The broadband sweep is centred on each line's LO and must stay
+            # inside the resonator IF limit.
+            half_span_hz = float(parameters["max_if_in_mhz"]) * 1e6
+            limit = float(self.limits["resonator_if_abs_hz"])
+            if half_span_hz > limit:
+                raise PolicyError(
+                    f"max_if_in_mhz {half_span_hz / 1e6:g} exceeds the "
+                    f"±{limit / 1e6:g} MHz resonator IF limit"
+                )
+            points = (
+                math.floor(2 * half_span_hz / (float(parameters["frequency_step_in_mhz"]) * 1e6))
+                + 1
+            )
+            if points > int(self.limits["max_sweep_points"]):
+                raise PolicyError(
+                    f"Broadband sweep has {points} points; policy maximum is "
+                    f"{self.limits['max_sweep_points']}"
+                )
+            design = parameters.get("res_design_freq")
+            res_num = parameters.get("res_num")
+            expected = res_num if res_num is not None else len(state.get("qubits", {}))
+            if design is not None and len(design) != expected:
+                raise PolicyError(
+                    f"res_design_freq has {len(design)} entries but res_num is {expected}"
+                )
         if node_id in {"02x", "02a", "02c"}:
             span_mhz = float(parameters["frequency_span_in_mhz"])
             resonator_rules = self.raw.get("analysis", {}).get("resonator", {})
@@ -294,6 +473,20 @@ class PolicyEngine:
                 raise PolicyError("max_power_dbm exceeds the OPX1000 policy limit")
             if parameters["min_power_dbm"] < -80:
                 raise PolicyError("min_power_dbm is below the policy floor")
+            # Operator rule 2026-10-05: the power window may be shifted but
+            # keeps its configured width.
+            window_db = (
+                self.raw.get("analysis", {}).get("02c", {}).get("power_window_db")
+            )
+            if window_db is not None and not math.isclose(
+                float(parameters["max_power_dbm"]) - float(parameters["min_power_dbm"]),
+                float(window_db),
+                abs_tol=1e-9,
+            ):
+                raise PolicyError(
+                    f"02c power window must span exactly {float(window_db):g} dB "
+                    "(shift min_power_dbm and max_power_dbm together)"
+                )
             if parameters["max_amp"] > 1:
                 raise PolicyError("max_amp cannot exceed normalized amplitude 1")
             if parameters["num_power_points"] > self.limits["max_sweep_points"]:
@@ -492,6 +685,25 @@ class PolicyEngine:
                     raise PolicyError(
                         f"Unsupported MW upconverter frequency at {path}"
                     )
+                port = pointer_get(updated, path.rsplit("/", 1)[0])
+                window = self.mw_band_lo_window(
+                    port.get("band") if isinstance(port, dict) else None
+                )
+                if window is not None and not window[0] <= float(value) <= window[1]:
+                    raise PolicyError(
+                        f"MW upconverter frequency {float(value) / 1e9:g} GHz at "
+                        f"{path} is outside the usable part of band "
+                        f"{port['band']}: keep it between "
+                        f"{window[0] / 1e9:g} GHz and {window[1] / 1e9:g} GHz."
+                    )
+                continue
+            if re.fullmatch(
+                r"/ports/mw_outputs/[^/]+/[0-9]+/[0-9]+/full_scale_power_dbm",
+                path,
+            ):
+                limits = self.limits["opx1000_full_scale_power_dbm"]
+                if not isinstance(value, int) or not limits["min"] <= value <= limits["max"]:
+                    raise PolicyError(f"Unsupported full-scale power at {path}")
                 continue
             parts = path.split("/")
             if len(parts) < 4:

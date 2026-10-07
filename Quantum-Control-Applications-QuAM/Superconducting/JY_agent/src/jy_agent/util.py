@@ -52,7 +52,14 @@ def json_compatible(value: Any) -> Any:
     QuAM uses list-like wrappers in recorded state updates.  Preserve their
     exact JSON structure for the audit file without falling back to lossy string
     representations of unknown objects.
+
+    A failed node fit records NaN (06b's ``fit_decay_exp`` on a rising trace),
+    which strict JSON cannot hold. Non-finite floats become ``None`` so the run
+    reaches analysis, where that one qubit is refused instead of the worker
+    crashing for every target.
     """
+    if isinstance(value, float) and not math.isfinite(value):
+        return None
     if value is None or isinstance(value, (str, bool, int, float)):
         return value
     if isinstance(value, Mapping):

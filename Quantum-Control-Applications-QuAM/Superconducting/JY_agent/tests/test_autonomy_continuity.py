@@ -331,9 +331,9 @@ class NodeParameterPreventionTests(unittest.TestCase):
             policy = self.policy(folder)
             merged, _warnings = policy.validate_run(
                 "02c",
-                {"qubits": ["q1"], "min_power_dbm": -36, "max_power_dbm": -26},
+                {"qubits": ["q1"], "min_power_dbm": -46, "max_power_dbm": -6},
             )
-            self.assertEqual(merged["min_power_dbm"], -36)
+            self.assertEqual(merged["min_power_dbm"], -46)
 
     def test_03a_rejects_arbitrary_frequency_before_flux_calibration(self) -> None:
         with tempfile.TemporaryDirectory() as folder:

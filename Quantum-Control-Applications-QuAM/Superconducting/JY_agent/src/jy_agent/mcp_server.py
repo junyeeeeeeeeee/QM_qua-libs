@@ -647,6 +647,29 @@ def jy_reopen_07b_after_morphology_rule_change(
 
 
 @mcp.tool()
+def jy_reopen_07d_after_readout_rule_change(
+    workflow_id: str,
+    reason: str,
+    client_id: str,
+    operation_id: str | None = None,
+) -> dict[str, Any]:
+    """Return from 07b/06 to 07d after a readout-selection rule change.
+
+    Requires no running node and no active or paused autonomy lease; earlier
+    07d/07b runs then no longer count toward single pass.
+    """
+    request = {"workflow_id": workflow_id, "reason": reason, "client_id": client_id}
+    return _mutation(
+        "jy_reopen_07d_after_readout_rule_change",
+        operation_id,
+        request,
+        lambda: service.reopen_07d_after_readout_rule_change(
+            workflow_id, reason, client_id
+        ),
+    )
+
+
+@mcp.tool()
 def jy_stop_workflow(
     workflow_id: str,
     client_id: str,
@@ -1101,6 +1124,37 @@ def jy_request_initial_03a_zero_if(
         request,
         lambda: service.request_initial_03a_zero_if(
             workflow_id, client_id, autonomy_lease_id
+        ),
+    )
+
+
+@mcp.tool()
+def jy_request_02c_window_recenter(
+    workflow_id: str,
+    qubits: list[str],
+    client_id: str,
+    autonomy_lease_id: str | None = None,
+    operation_id: str | None = None,
+) -> dict[str, Any]:
+    """Centre unresolved 02c readout IFs between their dressed and bare lines.
+
+    Use before a narrow 02c retry whose window must be 2-5x the bare-dressed
+    separation; the result lists each target's recommended span. With
+    autonomy_lease_id the setup is delegated (apply it with
+    jy_autonomy_apply_setup_state).
+    """
+    request = {
+        "workflow_id": workflow_id,
+        "qubits": qubits,
+        "client_id": client_id,
+        "autonomy_lease_id": autonomy_lease_id,
+    }
+    return _mutation(
+        "jy_request_02c_window_recenter",
+        operation_id,
+        request,
+        lambda: service.request_02c_window_recenter(
+            workflow_id, qubits, client_id, autonomy_lease_id
         ),
     )
 

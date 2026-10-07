@@ -8,7 +8,7 @@ import shutil
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Callable, Iterable
 
 from .util import atomic_write_json, exclusive_file_lock, sha256_file
 
@@ -207,6 +207,39 @@ def operation_amplitude(qubit: dict[str, Any], operation: str) -> float:
     return float(value)
 
 
+def xy_drive_groups(wiring: dict[str, Any]) -> dict[str, list[str]]:
+    """Qubit names grouped by the XY drive output each one is wired to."""
+
+    qubits = wiring.get("wiring", wiring).get("qubits", {})
+    if not isinstance(qubits, dict):
+        return {}
+    groups: dict[str, list[str]] = {}
+    for name, item in qubits.items():
+        if not isinstance(item, dict):
+            continue
+        xy = item.get("xy")
+        output = xy.get("opx_output") if isinstance(xy, dict) else None
+        if not isinstance(output, str):
+            continue
+        groups.setdefault(output, []).append(str(name))
+    return {output: sorted(names) for output, names in groups.items()}
+
+
+def shared_xy_drive_groups(wiring: dict[str, Any]) -> dict[str, list[str]]:
+    """Only the XY drive outputs that more than one qubit is wired to.
+
+    A chip with a single drive line reaching several qubits cannot address
+    them independently, so every node that uses the drive line has to measure
+    one qubit per run. See `PolicyEngine.shared_xy_drive_cap`.
+    """
+
+    return {
+        output: names
+        for output, names in xy_drive_groups(wiring).items()
+        if len(names) > 1
+    }
+
+
 def channel_kind(qubit: dict[str, Any]) -> str:
     class_name = str(qubit.get("xy", {}).get("__class__", ""))
     if class_name.endswith("MWChannel"):
@@ -264,8 +297,19 @@ def drive_lo_recenter_patch(
     force_zero_if: bool = False,
     target_lo_hz: dict[str, float] | None = None,
     target_rf_hz: dict[str, float] | None = None,
+    allow_shared_output: bool = False,
+    band_window: Callable[[Any], tuple[float, float] | None] | None = None,
+    max_if_abs_hz: float | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-    """Build private-XY LO/IF patches for 03a coarse-search placement."""
+    """Build XY LO/IF patches for 03a coarse-search placement.
+
+    A private XY output moves on its own. A shared one may only move with
+    `allow_shared_output`, for a single qubit at a time, and then every other
+    qubit on that port has its IF compensated so its RF is preserved -- the
+    port LO is one knob for all of them. `band_window` maps a port's band to
+    the LO range that band allows; an LO outside it is refused, except for an
+    explicit coarse-window shift, which is clamped to the edge so the 03a
+    search keeps moving instead of stalling."""
     if not qubits or len(set(qubits)) != len(qubits):
         raise StateError("LO recenter qubits must be a non-empty unique list")
     if (
@@ -313,11 +357,20 @@ def drive_lo_recenter_patch(
             if isinstance(item, dict)
             and item.get("xy", {}).get("opx_output") == output_ref
         )
+        companions: list[str] = []
         if owners != [name]:
-            raise StateError(
-                f"{name} XY output is shared by {owners or ['unknown']}; "
-                "automatic LO recenter requires a private output"
-            )
+            if not allow_shared_output:
+                raise StateError(
+                    f"{name} XY output is shared by {owners or ['unknown']}; "
+                    "automatic LO recenter requires a private output"
+                )
+            if len(qubits) != 1:
+                raise StateError(
+                    f"{name} XY output is shared by {owners or ['unknown']}; "
+                    "a shared LO moves for one qubit at a time, so recenter "
+                    "the qubit whose pass is starting on its own"
+                )
+            companions = [owner for owner in owners if owner != name]
 
         port_path = output_ref[1:]
         lo_path = f"{port_path}/upconverter_frequency"
@@ -370,6 +423,57 @@ def drive_lo_recenter_patch(
             new_lo = math.floor(old_rf / grid + 0.5) * grid
             new_if = old_rf - new_lo
             mode = "nearest_grid_preserve_rf"
+        window = None
+        if band_window is not None:
+            try:
+                band = pointer_get(state, f"{port_path}/band")
+            except (KeyError, IndexError, StateError):
+                # A port with no declared band keeps the global LO limits.
+                band = None
+            window = band_window(band)
+        clamped = False
+        if window is not None and not window[0] <= new_lo <= window[1]:
+            if mode != "shifted_coarse_window":
+                raise StateError(
+                    f"{name} needs an LO of {new_lo / 1e9:g} GHz, which is "
+                    f"outside the usable part of its band "
+                    f"({window[0] / 1e9:g}-{window[1] / 1e9:g} GHz)"
+                )
+            new_lo = min(max(new_lo, window[0]), window[1])
+            new_lo = math.floor(new_lo / grid + 0.5) * grid
+            new_lo = min(max(new_lo, window[0]), window[1])
+            clamped = True
+
+        compensated: dict[str, float] = {}
+        for companion in companions:
+            companion_if_path = f"/qubits/{companion}/xy/intermediate_frequency"
+            try:
+                companion_if = pointer_get(state, companion_if_path)
+            except (KeyError, IndexError, StateError) as exc:
+                raise StateError(
+                    f"Cannot resolve the XY IF of {companion}, which shares "
+                    f"the LO being moved for {name}"
+                ) from exc
+            if not isinstance(companion_if, (int, float)) or isinstance(
+                companion_if, bool
+            ):
+                raise StateError(f"{companion} XY IF must be numeric")
+            preserved = float(old_lo) + float(companion_if) - new_lo
+            if max_if_abs_hz is not None and abs(preserved) > float(max_if_abs_hz):
+                raise StateError(
+                    f"Moving the shared LO to {new_lo / 1e9:g} GHz for {name} "
+                    f"would put {companion} at an IF of {preserved / 1e6:g} MHz, "
+                    f"beyond the {float(max_if_abs_hz) / 1e6:g} MHz limit"
+                )
+            compensated[companion] = preserved
+            patch.append(
+                {
+                    "op": "replace",
+                    "path": companion_if_path,
+                    "value": preserved,
+                }
+            )
+
         patch.extend(
             [
                 {"op": "replace", "path": lo_path, "value": new_lo},
@@ -378,6 +482,10 @@ def drive_lo_recenter_patch(
         )
         details[name] = {
             "mode": mode,
+            "shared_with": companions,
+            "compensated_if_hz": compensated,
+            "band_window_hz": list(window) if window is not None else None,
+            "clamped_to_band": clamped,
             "xy_output": output_ref,
             "lo_grid_hz": grid,
             "old_lo_hz": float(old_lo),

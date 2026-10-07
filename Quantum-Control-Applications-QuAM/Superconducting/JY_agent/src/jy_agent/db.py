@@ -17,7 +17,8 @@ CREATE TABLE IF NOT EXISTS workflows (
     targets_json TEXT NOT NULL,
     initial_parameters_json TEXT NOT NULL,
     current_node TEXT,
-    client_id TEXT NOT NULL
+    client_id TEXT NOT NULL,
+    options_json TEXT
 );
 CREATE TABLE IF NOT EXISTS proposals (
     id TEXT PRIMARY KEY,
@@ -219,6 +220,8 @@ class Database:
     def _migrate(connection: sqlite3.Connection) -> None:
         """Apply additive migrations for runtime databases created by older JY builds."""
         for table, column, declaration in (
+            # Operator choices made on the lease approval page (2026-10-04).
+            ("workflows", "options_json", "TEXT"),
             ("proposals", "autonomy_lease_id", "TEXT"),
             ("runs", "autonomy_lease_id", "TEXT"),
             ("runs", "process_token", "TEXT"),

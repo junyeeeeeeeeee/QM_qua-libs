@@ -35,6 +35,14 @@ DEFAULT_02C_RULES: dict[str, Any] = {
     "bare_only_min_readout_length_ns": 1000,
     "bare_only_min_low_power_snr": 5.0,
     "bare_only_min_power_points": 30,
+    # Operator rule 2026-10-05: the frequency window must be about 2-5x the
+    # bare-dressed separation so the shift is visible; 0 disables a bound.
+    "min_window_to_separation_ratio": 0.0,
+    "max_window_to_separation_ratio": 0.0,
+    "recommended_window_to_separation_ratio": 3.5,
+    # A smeared or unstable low-power dressed plateau (e.g. a noise band read
+    # as dressed) blocks, so the power window can be shifted and rescanned.
+    "require_dressed_plateau_quality": False,
 }
 
 
@@ -276,8 +284,12 @@ def _analyze_trace(
     bare_coverage = float(np.mean(np.abs(bare_tail - bare_frequency) <= band))
     minimum_coverage = float(rules["plateau_min_coverage"])
     stability_blocks = bool(rules["require_plateau_stability"])
+    dressed_quality_blocks = bool(rules["require_dressed_plateau_quality"])
     if dressed_coverage < minimum_coverage:
-        _record(stability_blocks, "low-power dressed plateau is not stable")
+        _record(
+            stability_blocks or dressed_quality_blocks,
+            "low-power dressed plateau is not stable",
+        )
     if bare_coverage < minimum_coverage:
         _record(stability_blocks, "high-power bare plateau is not stable")
 
@@ -289,9 +301,32 @@ def _analyze_trace(
     )
     width_blocks = bool(rules["require_plateau_width"])
     if dressed_width > maximum_width:
-        _record(width_blocks, "low-power dressed plateau width is too large")
+        _record(
+            width_blocks or dressed_quality_blocks,
+            "low-power dressed plateau width is too large",
+        )
     if bare_width > maximum_width:
         _record(width_blocks, "high-power bare plateau width is too large")
+
+    window_ratio = sweep_span / separation if separation > 0 else math.inf
+    minimum_ratio = float(rules["min_window_to_separation_ratio"])
+    maximum_ratio = float(rules["max_window_to_separation_ratio"])
+    recommended_span_hz = (
+        float(rules["recommended_window_to_separation_ratio"]) * separation
+    )
+    if separation >= minimum_separation:
+        if maximum_ratio > 0 and window_ratio > maximum_ratio:
+            failures.append(
+                f"frequency window is {window_ratio:.1f}x the bare-dressed "
+                f"separation; narrow it to {minimum_ratio:g}-{maximum_ratio:g}x "
+                f"(about {recommended_span_hz / 1e6:.2f} MHz) centred between them"
+            )
+        elif minimum_ratio > 0 and window_ratio < minimum_ratio:
+            failures.append(
+                f"frequency window is only {window_ratio:.1f}x the bare-dressed "
+                f"separation; widen it to {minimum_ratio:g}-{maximum_ratio:g}x "
+                f"(about {recommended_span_hz / 1e6:.2f} MHz)"
+            )
 
     dressed_edge_fraction = _edge_fraction(
         dressed_frequency, sweep_min, sweep_max
@@ -407,6 +442,12 @@ def _analyze_trace(
         "dressed_frequency_hz": absolute_dressed,
         "bare_frequency_hz": absolute_bare,
         "bare_dressed_separation_hz": separation,
+        "frequency_window_hz": sweep_span,
+        "window_to_separation_ratio": (
+            window_ratio if math.isfinite(window_ratio) else None
+        ),
+        "recommended_frequency_span_mhz": round(recommended_span_hz / 1e6, 3),
+        "midpoint_frequency_offset_hz": (dressed_frequency + bare_frequency) / 2.0,
         "dressed_plateau_coverage": dressed_coverage,
         "bare_plateau_coverage": bare_coverage,
         "dressed_plateau_width_hz": dressed_width,

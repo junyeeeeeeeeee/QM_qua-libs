@@ -1,7 +1,7 @@
 # Calibration experience log
 
 This directory preserves reproducible experience for every bring-up node:
-`02x`, `02c`, `02a`, `03a`, `04`, `05`, `07b`, `06`, `06b`, `10a`,
+`02`, `02x`, `02c`, `02a`, `03a`, `04`, `05`, `07b`, `06`, `06b`, `10a`,
 `05st`, `06st_t2star`, and `06st_t2e`.
 
 Before proposing a run, read the relevant `<node>.md` file when it exists.

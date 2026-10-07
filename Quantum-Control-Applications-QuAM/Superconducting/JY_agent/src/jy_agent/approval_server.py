@@ -82,6 +82,12 @@ def create_approval_app(settings: Settings | None = None) -> Starlette:
     async def session_results(request: Request) -> Response:
         return await handle_session_dashboard(request, service, view="results")
 
+    async def session_usage(request: Request) -> Response:
+        return await handle_session_dashboard(request, service, view="usage")
+
+    async def session_usage_events(request: Request) -> Response:
+        return await handle_session_dashboard_events(request, service, view="usage")
+
     async def session_asset(request: Request) -> Response:
         return await handle_session_dashboard_asset(request, service)
 
@@ -191,6 +197,18 @@ def create_approval_app(settings: Settings | None = None) -> Starlette:
                 session_results,
                 methods=["GET", "POST"],
                 name="session_results",
+            ),
+            Route(
+                "/session/{session_id}/usage",
+                session_usage,
+                methods=["GET", "POST"],
+                name="session_usage",
+            ),
+            Route(
+                "/session/{session_id}/usage/events",
+                session_usage_events,
+                methods=["GET"],
+                name="session_usage_events",
             ),
             Route(
                 "/session/{session_id}/assets/{asset_index:int}",

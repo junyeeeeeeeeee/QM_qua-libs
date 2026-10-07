@@ -103,6 +103,7 @@ class LiveDashboardTelemetryTests(unittest.TestCase):
                     f"APPROVE {proposal_id}",
                     service.approval_csrf_token(proposal_id),
                     "127.0.0.1",
+                    lease_options={"optional_nodes": [], "drive_mode": "multiplex"},
                 )
 
             thread = threading.Thread(target=approve)
@@ -246,6 +247,7 @@ class LiveDashboardTelemetryTests(unittest.TestCase):
                 '<input id="confirmation" name="confirmation" type="text"',
                 body,
             )
+            self.assertIn('name="drive_mode" value="per_qubit" required', body)
 
             approval_body = urlencode(
                 {
@@ -253,6 +255,9 @@ class LiveDashboardTelemetryTests(unittest.TestCase):
                     "proposal_id": proposal_id,
                     "csrf_token": service.approval_csrf_token(proposal_id),
                     "confirmation": f"APPROVE {proposal_id}",
+                    # Operator request 2026-10-04: a lease needs the
+                    # measurement-mode choice from the approval page.
+                    "drive_mode": "multiplex",
                 }
             ).encode("utf-8")
             approved = asyncio.run(
@@ -344,6 +349,7 @@ class LiveDashboardTelemetryTests(unittest.TestCase):
                     "proposal_id": proposal["id"],
                     "csrf_token": service.approval_csrf_token(proposal["id"]),
                     "confirmation": f"APPROVE {proposal['id']}",
+                    "drive_mode": "multiplex",
                 }
             ).encode("utf-8")
             approved = asyncio.run(
@@ -414,6 +420,7 @@ class LiveDashboardTelemetryTests(unittest.TestCase):
                 {
                     "csrf_token": service.approval_csrf_token(first["id"]),
                     "confirmation": f"APPROVE {first['id']}",
+                    "drive_mode": "multiplex",
                 }
             ).encode("utf-8")
             legacy_approval = asyncio.run(

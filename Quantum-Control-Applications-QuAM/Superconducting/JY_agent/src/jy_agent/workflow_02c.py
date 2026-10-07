@@ -9,11 +9,16 @@ from .util import json_loads
 def resolve_02c_targets(
     run_rows: Iterable[dict[str, Any]],
 ) -> tuple[set[str], set[str]]:
-    """Return resolved and confirmed-absent targets from passing 02c analyses."""
+    """Return resolved and confirmed-absent targets from passing 02c analyses.
+
+    A ``needs_review`` run still resolves its passing targets: each target is
+    judged by its own validation failures, and the run commits those targets
+    (2026-10-05: the 2-5x window rule makes per-target passes the norm).
+    """
     resolved: set[str] = set()
     absent: set[str] = set()
     for row in run_rows:
-        if row.get("analysis_status") != "pass":
+        if row.get("analysis_status") not in {"pass", "needs_review"}:
             continue
         analysis = json_loads(row.get("analysis_json"), {})
         qubits = analysis.get("dataset_metrics", {}).get("qubits", {})

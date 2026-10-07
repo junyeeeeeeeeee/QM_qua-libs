@@ -111,6 +111,42 @@ reset_policy:
   active_qualification_node: "07b"
   active_min_readout_fidelity: 0.80
   active_statistics_verification_nodes: ["05", "06", "06b"]
+  # Operator choice 2026-10-04: after 07b, qubits qualified by an accepted
+  # active-reset 07b run use active reset at every later node with a reset
+  # parameter (06, 06b, 10a, statistics); the rest stay thermal. Each group
+  # has its own shared first batch and the two never share a run.
+  group_by_reset_after_qualification: true
+
+# Operator instruction 2026-09-22. Some chips route the XY drive of several
+# qubits to a single OPX output. Such a line cannot address one qubit without
+# also illuminating its neighbours, it needs high drive power or long gates to
+# move any of them, and its LO is shared, so placing one qubit at zero IF moves
+# every other qubit on the port. The trigger is the wiring file itself: any two
+# qubits sharing `wiring.qubits.<q>.xy.opx_output`.
+#
+# On such a chip the workflow stops being a node-by-node sweep over all targets
+# and becomes a qubit-by-qubit pass: 02, 02x, 02c and 02a still multiplex every
+# active target because they only use the readout line, and from
+# `serialize_from_node` the workflow takes ONE qubit through the whole remaining
+# sequence -- to the end, or until that qubit is scientifically unmeasurable or
+# out of attempts -- and only then returns to `serialize_from_node` for the next
+# qubit. That is what makes a shared LO safe: the drive LO only moves between
+# passes, never inside one.
+shared_xy_drive:
+  serialize_from_node: "03a"
+  per_qubit_pass: true
+  max_multiplex_targets: 1
+
+# Operator request 2026-10-04. The autonomy-lease approval page lists these
+# nodes as checkboxes (ticked by default); an unticked node is left out of that
+# workflow's sequence and of the lease, so the workflow goes straight past it.
+# The same page asks for the measurement mode from
+# `shared_xy_drive.serialize_from_node` on: `per_qubit` (one qubit through the
+# whole tail at a time; recommended when the wiring shares an XY output) or
+# `multiplex`. Automatic measurement starts only after that choice; the mode is
+# fixed for the rest of the workflow.
+workflow_options:
+  optional_nodes: ["02", "05st", "06st_t2star", "06st_t2e"]
 
 instrument_limits:
   qubit_if_abs_hz: 400000000
@@ -131,6 +167,16 @@ instrument_limits:
   mw_upconverter_frequency_hz:
     min: 2000000000
     max: 18000000000
+  # Operator instruction 2026-09-22. An LO placed near a band edge is a
+  # hardware error waiting to happen, so every upconverter frequency must stay
+  # at least `mw_band_edge_margin_hz` inside the band its port is configured
+  # for. These are the OPX1000 MW-FEM band ranges; correct them here if a
+  # future firmware widens them.
+  mw_band_frequency_hz:
+    1: {min: 50000000, max: 5500000000}
+    2: {min: 4500000000, max: 7500000000}
+    3: {min: 6500000000, max: 10500000000}
+  mw_band_edge_margin_hz: 100000000
   drive_lo_grid_hz: 100000000
   multiplex:
     max_qubits_per_run: 10
@@ -179,12 +225,33 @@ analysis:
     # must not silently block active-reset qualification either. Set this back
     # to true to restore the compact-cloud requirement for qualification.
     active_reset_requires_morphology: false
+    # Operator instruction 2026-10-02: judge the IQ clouds as two blobs.
+    # Shots on the other blob are readout errors (thermal population, decay)
+    # and are counted by fidelity; a cloud fails only when more than
+    # `two_blob_max_outlier_fraction` of its shots lie beyond
+    # `two_blob_outlier_sigma` of both blob centres (2D Gaussian: 1.1% at 3).
+    # The radius-quantile limits below are reported as advisory notes.
+    morphology_mode: "two_blob"
+    two_blob_outlier_sigma: 3.0
+    two_blob_max_outlier_fraction: 0.05
     max_cloud_axis_ratio: 4.0
     max_p95_to_median_radius: 4.0
     max_p99_to_median_radius: 4.0
     min_cloud_samples: 1000
     tail_retry_amplitude_factor: 0.7071067811865476
     min_readout_amplitude: 0.005
+  "07d":
+    # Operator instruction 2026-10-02: pick the highest fidelity among points
+    # whose g/e shots, pooled over +-`neighborhood_points` in frequency and
+    # amplitude, have at most `max_outlier_fraction` beyond `outlier_sigma` of
+    # both blob centres.
+    outlier_sigma: 3.0
+    max_outlier_fraction: 0.03
+    neighborhood_points: 1
+    # Operator choice 2026-10-03: never above the 02c dressed-limit power, and
+    # prefer the two-blob point only when it costs at most this much fidelity
+    # (percentage points); otherwise keep the fidelity optimum for 07b to judge.
+    fidelity_tolerance_percent: 2.0
   "03a":
     initial_coarse_span_mhz: 800.0
     initial_coarse_operation_amplitude_factor: 0.10
@@ -209,6 +276,14 @@ analysis:
     noise_confirmation_num_averages: [500, 1000, 2000]
     max_noise_confirmation_num_averages: 2000
   "02c":
+    # Operator instruction 2026-10-02: read out 10 dB below the dressed
+    # boundary, so 07d/07b start well clear of the bare-resonator transition.
+    readout_power_backoff_db: 10.0
+    # Each readout line's full scale is the smallest integer that keeps every
+    # pulse at or below this amplitude (07d's max_readout_amplitude) and the
+    # line's summed amplitude at or below
+    # instrument_limits.multiplex.max_aggregate_readout_amplitude.
+    max_readout_pulse_amplitude: 0.125
     plateau_tail_fraction: 0.20
     min_plateau_points: 4
     # Accept a slightly wander-y plateau when dressed/bare remain distinct.
@@ -243,12 +318,45 @@ analysis:
     bare_only_min_readout_length_ns: 1000
     bare_only_min_low_power_snr: 5.0
     bare_only_min_power_points: 30
+    # Operator rule 2026-10-05: a pass needs the frequency window to be about
+    # 2-5x the bare-dressed separation, so the dressed-to-bare shift is visible
+    # in the plot. A wider window fails and is rescanned narrower, centred
+    # between dressed and bare (jy_request_02c_window_recenter).
+    min_window_to_separation_ratio: 2.0
+    max_window_to_separation_ratio: 5.0
+    recommended_window_to_separation_ratio: 3.5
+    # A smeared or unstable low-power dressed plateau (q7 2026-10-05: a noise
+    # band below -44 dBm read as dressed) blocks; rescan with a shifted power
+    # window.
+    require_dressed_plateau_quality: true
+    # The power window may be shifted but always spans this many dB.
+    power_window_db: 40
     max_num_power_points: 30
     max_num_averages: 100
+
+usage:
+  # Operator request 2026-10-03: Dashboard usage page. Claude Code transcripts
+  # are read from ~/.claude/projects/<repository slug>/ unless transcript_dir
+  # is set here. Only token counts are read.
+  transcript_dir: null
+  pricing:
+    # Estimated cost at Anthropic API list prices (USD per million tokens,
+    # cached 2026-09-25). A Claude subscription plan is billed differently;
+    # this is the API-equivalent cost. Correct the numbers here if prices change.
+    cache_write_5m_multiplier: 1.25
+    cache_write_1h_multiplier: 2.0
+    fast_multiplier: 2.0
+    models:
+      claude-opus-5-5: {input: 4.0, output: 20.0, cache_read: 0.20}
+      claude-sonnet-5-5: {input: 2.0, output: 10.0, cache_read: 0.20}
+      claude-fable-5-1: {input: 10.0, output: 50.0, cache_read: 0.25}
+      claude-haiku-4-5: {input: 1.0, output: 5.0, cache_read: 0.10}
 
 state_commit:
   allowed_json_pointer_patterns:
     - "^/ports/mw_outputs/[^/]+/[0-9]+/[0-9]+/upconverter_frequency$"
+    # Only 02c writes this: its JY patch derives the readout-line full scale.
+    - "^/ports/mw_outputs/[^/]+/[0-9]+/[0-9]+/full_scale_power_dbm$"
     - "^/qubits/q[0-9]+/xy/intermediate_frequency$"
     - "^/qubits/q[0-9]+/xy/operations/[A-Za-z0-9_-]+/amplitude$"
     - "^/qubits/q[0-9]+/resonator/intermediate_frequency$"
@@ -265,6 +373,58 @@ state_commit:
   always_require_human_approval: true
 
 nodes:
+  # Operator request 2026-10-04: broadband survey ahead of 02x. One sweep per
+  # readout MW input over LO +/- max_if_in_mhz; it removes the electrical delay
+  # and lists resonator candidates. Without res_design_freq it is a survey and
+  # writes nothing; with it, only qubits whose candidate lies within
+  # design_match_tolerance_in_mhz of the globally shifted design move their
+  # readout IF. It is an optional node the operator ticks on the lease page,
+  # and it runs once with the workflow targets and moves on.
+  "02":
+    name: "02_Broadband_Spectroscopy"
+    script: "02_Broadband_Spectroscopy.py"
+    flux_behavior: "hardcoded_min"
+    single_pass: true
+    # Its result never blocks the workflow; 02x always follows.
+    advisory: true
+    defaults:
+      num_averages: 100
+      max_if_in_mhz: 400.0
+      frequency_step_in_mhz: 0.1
+      readout_length_in_ns: 2000
+      readout_power_dbm: null
+      res_num: null
+      res_design_freq: null
+      design_match_tolerance_in_mhz: 10.0
+      baseline_window_in_mhz: 15.0
+      min_resonator_separation_in_mhz: 5.0
+      lo_guard_in_mhz: 10.0
+      min_linewidth_in_mhz: 0.3
+      detection_snr: 6.0
+      simulate: false
+      simulation_duration_ns: 2500
+      timeout: 100
+      load_data_id: null
+    allowed_parameters:
+      qubits: "qubit_list"
+      num_averages: "positive_int"
+      max_if_in_mhz: "positive_number"
+      frequency_step_in_mhz: "positive_number"
+      readout_length_in_ns: "positive_int"
+      readout_power_dbm: "optional_number"
+      res_num: "optional_positive_int"
+      res_design_freq: "optional_positive_number_list"
+      design_match_tolerance_in_mhz: "positive_number"
+      baseline_window_in_mhz: "positive_number"
+      min_resonator_separation_in_mhz: "positive_number"
+      lo_guard_in_mhz: "nonnegative_number"
+      min_linewidth_in_mhz: "positive_number"
+      detection_snr: "positive_number"
+      simulate: "bool"
+      simulation_duration_ns: "positive_int"
+      timeout: "positive_int"
+      load_data_id: "optional_positive_int"
+
   "02x":
     name: "02x_Bare_Resonator_Spectroscopy"
     script: "02x_Bare_Resonator_Spectroscopy.py"
@@ -319,7 +479,7 @@ nodes:
     flux_behavior: "joint"
     defaults:
       num_averages: 100
-      frequency_span_in_mhz: 2.0
+      frequency_span_in_mhz: 16.0  # first pass finds the separation; retries narrow to 2-5x
       frequency_step_in_mhz: 0.03
       simulate: false
       simulation_duration_ns: 2500
@@ -488,15 +648,30 @@ nodes:
     script: "07d_Readout_Frequency_Duration_Power_Optimization.py"
     flux_behavior: "joint"
     single_pass: true
+    # Operator instruction 2026-09-29. The node's measurement batching
+    # (quam_libs readout_optimization_3d, _generate_balanced_subsets_indices)
+    # slices objects[i:i+S] instead of objects[i*S:(i+1)*S], so above four
+    # qubits it silently drops targets and then crashes with KeyError (run
+    # 01b027b2fd17411e9c0da43eea488cf6 measured only 6 of 10). Four or fewer is
+    # one batch. Single pass then means one run per group of at most four.
+    max_multiplex_targets: 4
+    # Operator instruction 2026-10-02: 02c now commits the dressed limit minus
+    # 10 dB, and the first 07d group's optima all sat at the 1.99 top of the
+    # sweep. 3.16 (+10 dB) reaches back up to the dressed limit; 22 points keep
+    # the step near the old 0.13. A run on an older value of these keys no
+    # longer counts toward single pass.
+    # num_runs 40 -> 100 (2026-10-02): the two-blob selection needs shots per
+    # point; 9 pooled points x 200 shots resolve a few-% off-blob share.
+    single_pass_default_keys: ["max_amplitude_factor", "num_runs"]
     defaults:
       multiplexed: true
       flux_point_joint_or_independent: "joint"
-      num_runs: 40
+      num_runs: 100
       frequency_span_in_mhz: 6
       frequency_step_in_mhz: 0.2
       min_amplitude_factor: 0.2
-      max_amplitude_factor: 1.99
-      num_amplitudes: 15
+      max_amplitude_factor: 3.16
+      num_amplitudes: 22
       max_duration_in_ns: 2080
       num_durations: 8
       plotting_dimension: "2D"
@@ -555,14 +730,21 @@ nodes:
     name: "06_Ramsey"
     script: "06_Ramsey.py"
     flux_behavior: "joint"
+    # Operator instruction 2026-10-02: the detuning is inversely proportional
+    # to the window, detuning [MHz] x max wait [us] ~= 4 (1 us -> 4 MHz,
+    # 10 us -> 0.4 MHz), so every Ramsey plot shows about four fringes. A run
+    # that omits frequency_detuning_in_mhz gets the derived value; an explicit
+    # value more than the tolerance away is refused before the hardware.
+    detuning_wait_product_mhz_us: 4.0
+    detuning_wait_product_tolerance: 0.25
     defaults:
       num_averages: 1000
       reset_type: "thermal"
-      frequency_detuning_in_mhz: 8.0
+      frequency_detuning_in_mhz: 0.1
       min_wait_time_in_ns: 16
-      max_wait_time_in_ns: 200000
-      num_time_points: 100
-      log_or_linear_sweep: "log"
+      max_wait_time_in_ns: 40000
+      num_time_points: 400
+      log_or_linear_sweep: "linear"
       use_state_discrimination: true
       flux_point_joint_or_independent: "joint"
       load_data_id: null
