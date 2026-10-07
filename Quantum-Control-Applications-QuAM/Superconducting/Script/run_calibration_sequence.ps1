@@ -12,9 +12,6 @@
 
 $ErrorActionPreference = "Stop"
 
-# --- Canonical Python：與 JY 量測模式共用同一個 qualibrate_env ---
-$Python = "D:\QM\miniforge3\envs\qualibrate_env\python.exe"
-
 # --- 路徑 ---
 $Root = Split-Path -Parent $PSScriptRoot
 $RunFile = Join-Path $PSScriptRoot "_run_file.py"
@@ -188,7 +185,7 @@ if ($SkipFailed) { $batchArgs += "--skip-failed" }
 
 $batchExit = 0
 try {
-    & $Python @batchArgs
+    & python @batchArgs
     $batchExit = $LASTEXITCODE
 } finally {
     Remove-Item -LiteralPath $queueFile -ErrorAction SilentlyContinue
